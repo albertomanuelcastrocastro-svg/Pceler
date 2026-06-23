@@ -1,6 +1,6 @@
 """
-PCELER — Acelerómetro PALMERO
-================================
+PCELER — Acelerómetro PALMERO (v1.1)
+========================================
 Servicio independiente que estudia la pendiente (ángulo de ataque) de la
 línea MACD (azul, rápida) por timeframe para XRP y SOL.
 
@@ -19,6 +19,8 @@ Tres capas:
      giro, para calibrar el mejor umbral antes de implementar en Pine.
 
 No depende de ningún otro servicio PALMERO. Lee directamente de Binance.
+
+v1.1: corregido bug de serialización numpy.bool_ en evaluar_senales.
 """
 
 import os
@@ -49,7 +51,6 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Umbrales de giro a probar en la simulación
 UMBRALES_GIRO = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
 
 _cache = {}
@@ -101,7 +102,7 @@ def estadisticas_pendientes(pendientes):
     if len(pendientes) < 10:
         return None
     return {
-        "n_velas": len(pendientes),
+        "n_velas": int(len(pendientes)),
         "media": round(float(np.mean(pendientes)), 8),
         "std": round(float(np.std(pendientes)), 8),
         "min": round(float(np.min(pendientes)), 8),
@@ -122,8 +123,8 @@ def detectar_apogeo_y_giro(pendientes, percentiles):
 
     p90 = percentiles["percentil_90"]
     p10 = percentiles["percentil_10"]
-    actual = pendientes[-1]
-    anterior = pendientes[-2]
+    actual = float(pendientes[-1])
+    anterior = float(pendientes[-2])
 
     en_apogeo_alcista = actual >= p90
     en_apogeo_bajista = actual <= p10
@@ -131,8 +132,9 @@ def detectar_apogeo_y_giro(pendientes, percentiles):
     retroceso_desde_max = None
     retroceso_desde_min = None
 
-    max_reciente = float(np.max(pendientes[-20:])) if len(pendientes) >= 20 else float(np.max(pendientes[-5:]))
-    min_reciente = float(np.min(pendientes[-20:])) if len(pendientes) >= 20 else float(np.min(pendientes[-5:]))
+    ventana = min(20, len(pendientes))
+    max_reciente = float(np.max(pendientes[-ventana:]))
+    min_reciente = float(np.min(pendientes[-ventana:]))
 
     if max_reciente > 0 and actual < max_reciente:
         retroceso_desde_max = round((max_reciente - actual) / abs(max_reciente), 4)
@@ -142,20 +144,22 @@ def detectar_apogeo_y_giro(pendientes, percentiles):
     pendiente_subiendo = actual > anterior
     pendiente_bajando = actual < anterior
 
+    percentil_actual = float(
+        np.searchsorted(np.sort(pendientes), actual) / len(pendientes) * 100
+    )
+
     return {
-        "pendiente_actual": round(float(actual), 8),
-        "pendiente_anterior": round(float(anterior), 8),
+        "pendiente_actual": round(actual, 8),
+        "pendiente_anterior": round(anterior, 8),
         "pendiente_subiendo": bool(pendiente_subiendo),
         "pendiente_bajando": bool(pendiente_bajando),
         "en_apogeo_alcista": bool(en_apogeo_alcista),
         "en_apogeo_bajista": bool(en_apogeo_bajista),
-        "max_reciente_20v": round(float(max_reciente), 8),
-        "min_reciente_20v": round(float(min_reciente), 8),
+        "max_reciente_20v": round(max_reciente, 8),
+        "min_reciente_20v": round(min_reciente, 8),
         "retroceso_desde_max_pct": retroceso_desde_max,
         "retroceso_desde_min_pct": retroceso_desde_min,
-        "percentil_actual": round(float(
-            np.searchsorted(np.sort(pendientes), actual) / len(pendientes) * 100
-        ), 1),
+        "percentil_actual": round(percentil_actual, 1),
     }
 
 
@@ -168,15 +172,15 @@ def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
     p10 = percentiles["percentil_10"]
 
     en_apogeo_alcista = False
-    max_pendiente_alcista = 0
+    max_pendiente_alcista = 0.0
     en_apogeo_bajista = False
-    min_pendiente_bajista = 0
+    min_pendiente_bajista = 0.0
 
     ultima_senal_idx = -30
 
     for i in range(1, len(pendientes)):
-        p = pendientes[i]
-        p_prev = pendientes[i - 1]
+        p = float(pendientes[i])
+        p_prev = float(pendientes[i - 1])
 
         if p >= p90:
             en_apogeo_alcista = True
@@ -194,17 +198,17 @@ def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
                     senales.append({
                         "tipo": "SHORT",
                         "motivo": "giro_bajista_desde_apogeo",
-                        "vela_idx": precio_idx,
+                        "vela_idx": int(precio_idx),
                         "precio": round(float(closes[precio_idx]), 6),
                         "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
-                        "pendiente_en_giro": round(float(p), 8),
-                        "max_pendiente": round(float(max_pendiente_alcista), 8),
+                        "pendiente_en_giro": round(p, 8),
+                        "max_pendiente": round(max_pendiente_alcista, 8),
                         "retroceso_pct": round(float(retroceso), 4),
-                        "umbral_usado": umbral,
+                        "umbral_usado": float(umbral),
                     })
                     ultima_senal_idx = i
                 en_apogeo_alcista = False
-                max_pendiente_alcista = 0
+                max_pendiente_alcista = 0.0
 
         if en_apogeo_bajista and min_pendiente_bajista < 0:
             retroceso = (p - min_pendiente_bajista) / abs(min_pendiente_bajista)
@@ -214,17 +218,17 @@ def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
                     senales.append({
                         "tipo": "LONG",
                         "motivo": "giro_alcista_desde_apogeo",
-                        "vela_idx": precio_idx,
+                        "vela_idx": int(precio_idx),
                         "precio": round(float(closes[precio_idx]), 6),
                         "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
-                        "pendiente_en_giro": round(float(p), 8),
-                        "min_pendiente": round(float(min_pendiente_bajista), 8),
+                        "pendiente_en_giro": round(p, 8),
+                        "min_pendiente": round(min_pendiente_bajista, 8),
                         "retroceso_pct": round(float(retroceso), 4),
-                        "umbral_usado": umbral,
+                        "umbral_usado": float(umbral),
                     })
                     ultima_senal_idx = i
                 en_apogeo_bajista = False
-                min_pendiente_bajista = 0
+                min_pendiente_bajista = 0.0
 
     return senales
 
@@ -236,18 +240,30 @@ def evaluar_senales(senales, closes, n_velas_futuras=20):
         if idx + n_velas_futuras >= len(closes):
             continue
         entrada = s["precio"]
-        dir_mult = -1 if s["tipo"] == "SHORT" else 1
+        if entrada == 0:
+            continue
+        dir_mult = -1.0 if s["tipo"] == "SHORT" else 1.0
         precios_futuros = closes[idx + 1: idx + 1 + n_velas_futuras]
-        mejor = dir_mult * (min(precios_futuros) if s["tipo"] == "SHORT" else max(precios_futuros))
-        mejor_pct = dir_mult * ((min(precios_futuros) if s["tipo"] == "SHORT" else max(precios_futuros)) - entrada) / entrada * 100
-        cierre_20v = closes[idx + n_velas_futuras]
+        if len(precios_futuros) == 0:
+            continue
+        if s["tipo"] == "SHORT":
+            mejor_precio = float(np.min(precios_futuros))
+        else:
+            mejor_precio = float(np.max(precios_futuros))
+        mejor_pct = dir_mult * (mejor_precio - entrada) / entrada * 100
+        cierre_20v = float(closes[idx + n_velas_futuras])
         resultado_20v = dir_mult * (cierre_20v - entrada) / entrada * 100
 
         resultados.append({
-            **s,
+            "tipo": s["tipo"],
+            "motivo": s["motivo"],
+            "precio": s["precio"],
+            "timestamp": s["timestamp"],
+            "umbral_usado": s["umbral_usado"],
+            "retroceso_pct": s["retroceso_pct"],
             "mejor_pct_20v": round(float(mejor_pct), 3),
             "resultado_20v_pct": round(float(resultado_20v), 3),
-            "ganadora_20v": resultado_20v > 0,
+            "ganadora_20v": bool(resultado_20v > 0),
         })
     return resultados
 
@@ -265,12 +281,9 @@ def analizar_tf(symbol, tf_label, interval, limit):
 
     macd_line, signal_line, histogram = calcular_macd(closes)
     pendientes = calcular_pendientes(macd_line)
-    aceleracion = calcular_aceleracion(pendientes)
 
     skip = MACD_SLOW + MACD_SIGNAL
     pendientes_validas = pendientes[skip:]
-    closes_validas = closes[skip + 1:]
-    timestamps_validos = timestamps[skip + 1:]
 
     percentiles = estadisticas_pendientes(pendientes_validas)
     estado = detectar_apogeo_y_giro(pendientes_validas, percentiles)
@@ -282,7 +295,7 @@ def analizar_tf(symbol, tf_label, interval, limit):
         "signal_actual": round(float(signal_line[-1]), 8),
         "calibracion": percentiles,
         "estado": estado,
-        "n_velas_analizadas": len(pendientes_validas),
+        "n_velas_analizadas": int(len(pendientes_validas)),
     }
 
 
@@ -316,20 +329,20 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
         if evaluadas:
             ganadoras = sum(1 for s in evaluadas if s["ganadora_20v"])
             resultados_por_umbral[str(umbral)] = {
-                "umbral": umbral,
-                "n_senales": len(evaluadas),
-                "winrate_pct": round(ganadoras / len(evaluadas) * 100, 1),
+                "umbral": float(umbral),
+                "n_senales": int(len(evaluadas)),
+                "winrate_pct": round(float(ganadoras / len(evaluadas) * 100), 1),
                 "resultado_medio_pct": round(
-                    sum(s["resultado_20v_pct"] for s in evaluadas) / len(evaluadas), 3
+                    float(sum(s["resultado_20v_pct"] for s in evaluadas) / len(evaluadas)), 3
                 ),
                 "mejor_medio_pct": round(
-                    sum(s["mejor_pct_20v"] for s in evaluadas) / len(evaluadas), 3
+                    float(sum(s["mejor_pct_20v"] for s in evaluadas) / len(evaluadas)), 3
                 ),
                 "senales": evaluadas[-10:],
             }
         else:
             resultados_por_umbral[str(umbral)] = {
-                "umbral": umbral,
+                "umbral": float(umbral),
                 "n_senales": 0,
                 "winrate_pct": None,
                 "resultado_medio_pct": None,
@@ -339,7 +352,7 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
 
     return {
         "tf": tf_label,
-        "n_velas": len(closes),
+        "n_velas": int(len(closes)),
         "umbrales": resultados_por_umbral,
     }
 
@@ -348,6 +361,7 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
 def home():
     return jsonify({
         "servicio": "PCELER — Acelerómetro PALMERO",
+        "version": "1.1",
         "descripcion": "Estudio de pendientes y aceleración de la línea MACD para anticipar giros de tendencia",
         "endpoints": [
             "/estado/<symbol> — estado actual: pendiente, percentil, apogeo, giro (todos los TFs)",
@@ -364,7 +378,7 @@ def home():
 def estado_symbol(symbol):
     symbol = symbol.upper()
     if symbol not in SYMBOLS:
-        return jsonify({"error": f"símbolo no soportado: {symbol}"}), 400
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     resultado = {
         "simbolo": symbol,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -383,7 +397,7 @@ def estado_symbol_tf(symbol, tf):
     symbol = symbol.upper()
     tf = tf.lower()
     if symbol not in SYMBOLS:
-        return jsonify({"error": f"símbolo no soportado: {symbol}"}), 400
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     if tf not in TIMEFRAMES:
         return jsonify({"error": f"TF no soportado: {tf}"}), 400
     cfg = TIMEFRAMES[tf]
@@ -402,7 +416,7 @@ def estado_symbol_tf(symbol, tf):
 def calibracion_symbol(symbol):
     symbol = symbol.upper()
     if symbol not in SYMBOLS:
-        return jsonify({"error": f"símbolo no soportado: {symbol}"}), 400
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     resultado = {
         "simbolo": symbol,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -421,7 +435,7 @@ def calibracion_symbol(symbol):
                 "tf": label,
                 "pendientes": estadisticas_pendientes(pendientes_validas),
                 "aceleracion": estadisticas_pendientes(aceleracion),
-                "n_velas": len(pendientes_validas),
+                "n_velas": int(len(pendientes_validas)),
             }
         except Exception as e:
             resultado["timeframes"][label] = {"error": str(e)}
@@ -432,7 +446,7 @@ def calibracion_symbol(symbol):
 def senales_symbol(symbol):
     symbol = symbol.upper()
     if symbol not in SYMBOLS:
-        return jsonify({"error": f"símbolo no soportado: {symbol}"}), 400
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     resultado = {
         "simbolo": symbol,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -453,7 +467,7 @@ def senales_symbol_tf(symbol, tf):
     symbol = symbol.upper()
     tf = tf.lower()
     if symbol not in SYMBOLS:
-        return jsonify({"error": f"símbolo no soportado: {symbol}"}), 400
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     if tf not in TIMEFRAMES:
         return jsonify({"error": f"TF no soportado: {tf}"}), 400
     cfg = TIMEFRAMES[tf]
