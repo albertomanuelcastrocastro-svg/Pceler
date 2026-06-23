@@ -1,5 +1,5 @@
 """
-PCELER — Acelerómetro PALMERO (v1.1)
+PCELER — Acelerómetro PALMERO (v2.0)
 ========================================
 Servicio independiente que estudia la pendiente (ángulo de ataque) de la
 línea MACD (azul, rápida) por timeframe para XRP y SOL.
@@ -10,17 +10,17 @@ principal dice "manos quietas".
 
 Tres capas:
   1. CALIBRACIÓN — estadísticas históricas de pendientes: percentiles,
-     extremos, distribución. Responde: ¿cuáles son los techos y suelos
-     reales de aceleración del MACD?
+     extremos, distribución.
   2. ESTADO EN TIEMPO REAL — pendiente actual del MACD en cada TF,
      en qué percentil se encuentra, si está en zona de apogeo o giro.
-  3. SEÑALES HISTÓRICAS — simulación retrospectiva de qué señales habría
-     generado el Acelerómetro con distintos umbrales de confirmación de
-     giro, para calibrar el mejor umbral antes de implementar en Pine.
+  3. SEÑALES HISTÓRICAS — simulación retrospectiva con distintos umbrales.
+
+v2.0: REGLA DE HIERRO integrada. Las señales en TFs menores (5m, 15m, 1h)
+se filtran por la dirección del MACD 4H en el momento exacto de la señal.
+Solo pasan LONGs cuando 4H sube, SHORTs cuando 4H baja.
+Muestra resultados filtrados y sin filtrar para comparar.
 
 No depende de ningún otro servicio PALMERO. Lee directamente de Binance.
-
-v1.1: corregido bug de serialización numpy.bool_ en evaluar_senales.
 """
 
 import os
@@ -89,13 +89,11 @@ def calcular_macd(closes):
 
 
 def calcular_pendientes(macd_line):
-    pendientes = np.diff(macd_line)
-    return pendientes
+    return np.diff(macd_line)
 
 
 def calcular_aceleracion(pendientes):
-    aceleracion = np.diff(pendientes)
-    return aceleracion
+    return np.diff(pendientes)
 
 
 def estadisticas_pendientes(pendientes):
@@ -163,6 +161,40 @@ def detectar_apogeo_y_giro(pendientes, percentiles):
     }
 
 
+def obtener_direccion_4h(symbol, timestamps_senales):
+    raw_4h = fetch_klines(symbol, "4h", 500)
+    closes_4h = np.array([float(k[4]) for k in raw_4h])
+    open_times_4h = [int(k[0]) for k in raw_4h]
+    close_times_4h = [int(k[6]) for k in raw_4h]
+
+    macd_4h, _, _ = calcular_macd(closes_4h)
+    pendientes_4h = calcular_pendientes(macd_4h)
+
+    direccion_por_ts = {}
+    for ts_str in timestamps_senales:
+        if ts_str is None:
+            continue
+        ts_dt = datetime.fromisoformat(ts_str)
+        ts_ms = int(ts_dt.timestamp() * 1000)
+
+        dir_4h = "lateral"
+        for j in range(len(open_times_4h)):
+            if open_times_4h[j] <= ts_ms <= close_times_4h[j]:
+                if j >= MACD_SLOW + MACD_SIGNAL + 1:
+                    idx_pendiente = j - 1
+                    if idx_pendiente < len(pendientes_4h):
+                        p = float(pendientes_4h[idx_pendiente])
+                        if p > 0:
+                            dir_4h = "alcista"
+                        elif p < 0:
+                            dir_4h = "bajista"
+                break
+
+        direccion_por_ts[ts_str] = dir_4h
+
+    return direccion_por_ts
+
+
 def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
     if percentiles is None or len(pendientes) < 30:
         return []
@@ -180,7 +212,6 @@ def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
 
     for i in range(1, len(pendientes)):
         p = float(pendientes[i])
-        p_prev = float(pendientes[i - 1])
 
         if p >= p90:
             en_apogeo_alcista = True
@@ -233,6 +264,21 @@ def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
     return senales
 
 
+def filtrar_por_4h(senales, direccion_4h):
+    filtradas = []
+    for s in senales:
+        ts = s.get("timestamp")
+        if ts is None:
+            continue
+        dir_4h = direccion_4h.get(ts, "lateral")
+        s["direccion_4h"] = dir_4h
+        if s["tipo"] == "LONG" and dir_4h == "alcista":
+            filtradas.append(s)
+        elif s["tipo"] == "SHORT" and dir_4h == "bajista":
+            filtradas.append(s)
+    return filtradas
+
+
 def evaluar_senales(senales, closes, n_velas_futuras=20):
     resultados = []
     for s in senales:
@@ -254,7 +300,7 @@ def evaluar_senales(senales, closes, n_velas_futuras=20):
         cierre_20v = float(closes[idx + n_velas_futuras])
         resultado_20v = dir_mult * (cierre_20v - entrada) / entrada * 100
 
-        resultados.append({
+        resultado = {
             "tipo": s["tipo"],
             "motivo": s["motivo"],
             "precio": s["precio"],
@@ -264,8 +310,32 @@ def evaluar_senales(senales, closes, n_velas_futuras=20):
             "mejor_pct_20v": round(float(mejor_pct), 3),
             "resultado_20v_pct": round(float(resultado_20v), 3),
             "ganadora_20v": bool(resultado_20v > 0),
-        })
+        }
+        if "direccion_4h" in s:
+            resultado["direccion_4h"] = s["direccion_4h"]
+        resultados.append(resultado)
     return resultados
+
+
+def resumir_evaluacion(evaluadas):
+    if not evaluadas:
+        return {
+            "n_senales": 0,
+            "winrate_pct": None,
+            "resultado_medio_pct": None,
+            "mejor_medio_pct": None,
+        }
+    ganadoras = sum(1 for s in evaluadas if s["ganadora_20v"])
+    return {
+        "n_senales": int(len(evaluadas)),
+        "winrate_pct": round(float(ganadoras / len(evaluadas) * 100), 1),
+        "resultado_medio_pct": round(
+            float(sum(s["resultado_20v_pct"] for s in evaluadas) / len(evaluadas)), 3
+        ),
+        "mejor_medio_pct": round(
+            float(sum(s["mejor_pct_20v"] for s in evaluadas) / len(evaluadas)), 3
+        ),
+    }
 
 
 def analizar_tf(symbol, tf_label, interval, limit):
@@ -274,11 +344,6 @@ def analizar_tf(symbol, tf_label, interval, limit):
         return {"error": "datos_insuficientes"}
 
     closes = np.array([float(k[4]) for k in raw])
-    timestamps = [
-        datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat()
-        for k in raw
-    ]
-
     macd_line, signal_line, histogram = calcular_macd(closes)
     pendientes = calcular_pendientes(macd_line)
 
@@ -320,39 +385,49 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
 
     percentiles = estadisticas_pendientes(pendientes_validas)
 
+    es_tf_menor = tf_label in ("5m", "15m", "1h")
+    direccion_4h = {}
+    if es_tf_menor:
+        try:
+            all_timestamps = []
+            for umbral in UMBRALES_GIRO:
+                senales_temp = simular_senales(
+                    pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral
+                )
+                all_timestamps.extend([s["timestamp"] for s in senales_temp if s["timestamp"]])
+            all_timestamps = list(set(all_timestamps))
+            if all_timestamps:
+                direccion_4h = obtener_direccion_4h(symbol, all_timestamps)
+        except Exception as e:
+            print(f"Error obteniendo dirección 4H: {e}")
+
     resultados_por_umbral = {}
     for umbral in UMBRALES_GIRO:
         senales = simular_senales(
             pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral
         )
-        evaluadas = evaluar_senales(senales, closes_validas)
-        if evaluadas:
-            ganadoras = sum(1 for s in evaluadas if s["ganadora_20v"])
-            resultados_por_umbral[str(umbral)] = {
-                "umbral": float(umbral),
-                "n_senales": int(len(evaluadas)),
-                "winrate_pct": round(float(ganadoras / len(evaluadas) * 100), 1),
-                "resultado_medio_pct": round(
-                    float(sum(s["resultado_20v_pct"] for s in evaluadas) / len(evaluadas)), 3
-                ),
-                "mejor_medio_pct": round(
-                    float(sum(s["mejor_pct_20v"] for s in evaluadas) / len(evaluadas)), 3
-                ),
-                "senales": evaluadas[-10:],
-            }
-        else:
-            resultados_por_umbral[str(umbral)] = {
-                "umbral": float(umbral),
-                "n_senales": 0,
-                "winrate_pct": None,
-                "resultado_medio_pct": None,
-                "mejor_medio_pct": None,
-                "senales": [],
-            }
+        evaluadas_sin_filtro = evaluar_senales(senales, closes_validas)
+        resumen_sin_filtro = resumir_evaluacion(evaluadas_sin_filtro)
+        resumen_sin_filtro["senales"] = evaluadas_sin_filtro[-10:]
+
+        resultado_umbral = {
+            "umbral": float(umbral),
+            "sin_filtro": resumen_sin_filtro,
+        }
+
+        if es_tf_menor and direccion_4h:
+            senales_filtradas = filtrar_por_4h(senales, direccion_4h)
+            evaluadas_filtradas = evaluar_senales(senales_filtradas, closes_validas)
+            resumen_filtrado = resumir_evaluacion(evaluadas_filtradas)
+            resumen_filtrado["senales"] = evaluadas_filtradas[-10:]
+            resultado_umbral["filtro_4h"] = resumen_filtrado
+
+        resultados_por_umbral[str(umbral)] = resultado_umbral
 
     return {
         "tf": tf_label,
         "n_velas": int(len(closes)),
+        "filtro_4h_aplicado": bool(es_tf_menor and direccion_4h),
         "umbrales": resultados_por_umbral,
     }
 
@@ -361,14 +436,15 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
 def home():
     return jsonify({
         "servicio": "PCELER — Acelerómetro PALMERO",
-        "version": "1.1",
+        "version": "2.0",
+        "novedad": "Regla de hierro 4H integrada en señales de TFs menores",
         "descripcion": "Estudio de pendientes y aceleración de la línea MACD para anticipar giros de tendencia",
         "endpoints": [
             "/estado/<symbol> — estado actual: pendiente, percentil, apogeo, giro (todos los TFs)",
             "/estado/<symbol>/<tf> — estado de un TF concreto (4h, 1h, 15m, 5m)",
             "/calibracion/<symbol> — estadísticas históricas de pendientes por TF",
-            "/senales/<symbol> — simulación de señales históricas con distintos umbrales de giro",
-            "/senales/<symbol>/<tf> — señales de un TF concreto",
+            "/senales/<symbol> — simulación de señales históricas con filtro 4H",
+            "/senales/<symbol>/<tf> — señales de un TF concreto con filtro 4H",
             "/t/<bust> — versión sin caché de /estado de todos los símbolos",
         ],
     })
