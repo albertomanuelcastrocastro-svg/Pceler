@@ -1,9 +1,19 @@
 """
-PCELER — Acelerómetro PALMERO (v2.1)
+PCELER — Acelerómetro PALMERO (v2.2)
 ========================================
-v2.1: añade /laboratorio — evalúa las señales del Acelerómetro (con filtro 4H,
-umbral configurable) contra todas las configuraciones de SL/TP del laboratorio
-de PALMERO, para encontrar la gestión óptima para las señales del Acelerómetro.
+v2.2: añade lógica SIMPLIFICADA en paralelo a la de percentiles.
+
+Lógica simplificada:
+  - Giro alcista: pendiente del MACD 15M pasa de negativa a positiva
+    (sign change up)
+  - Giro bajista: pendiente del MACD 15M pasa de positiva a negativa
+    (sign change down)
+  - Filtro 4H igual: solo LONGs cuando 4H sube, SHORTs cuando baja
+  - Anti-spam: gap mínimo entre señales
+
+Esta lógica es PORTABLE a Pine Script sin riesgo de repintado.
+Si los resultados son similares a la lógica de percentiles, será la
+elegida para el indicador de TradingView.
 """
 
 import os
@@ -36,38 +46,20 @@ MACD_SIGNAL = 9
 
 UMBRALES_GIRO = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
 
-# Configuraciones de SL/TP a probar en el laboratorio
+# Configuraciones de SL/TP
 CONFIGS_LAB = {
-    "actual": {
-        "sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
-        "tp2_pct": 0.008, "tp2_peso": 0.30,
-        "stop_tras_tp1_pct": 0.0, "stop_tras_tp2_pct": 0.0,
-    },
-    "margen_amplio": {
-        "sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
-        "tp2_pct": 0.008, "tp2_peso": 0.30,
-        "stop_tras_tp1_pct": -0.003, "stop_tras_tp2_pct": -0.003,
-    },
-    "escala_amplia": {
-        "sl_pct": -0.02, "tp1_pct": 0.01, "tp1_peso": 0.40,
-        "tp2_pct": 0.016, "tp2_peso": 0.30,
-        "stop_tras_tp1_pct": -0.01, "stop_tras_tp2_pct": -0.01,
-    },
-    "escala_xl": {
-        "sl_pct": -0.03, "tp1_pct": 0.015, "tp1_peso": 0.40,
-        "tp2_pct": 0.025, "tp2_peso": 0.30,
-        "stop_tras_tp1_pct": -0.015, "stop_tras_tp2_pct": -0.015,
-    },
-    "escala_xxl": {
-        "sl_pct": -0.04, "tp1_pct": 0.02, "tp1_peso": 0.40,
-        "tp2_pct": 0.035, "tp2_peso": 0.30,
-        "stop_tras_tp1_pct": -0.02, "stop_tras_tp2_pct": -0.02,
-    },
-    "sin_breakeven": {
-        "sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
-        "tp2_pct": 0.008, "tp2_peso": 0.30,
-        "stop_tras_tp1_pct": -0.005, "stop_tras_tp2_pct": -0.005,
-    },
+    "actual": {"sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
+        "tp2_pct": 0.008, "tp2_peso": 0.30, "stop_tras_tp1_pct": 0.0, "stop_tras_tp2_pct": 0.0},
+    "margen_amplio": {"sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
+        "tp2_pct": 0.008, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.003, "stop_tras_tp2_pct": -0.003},
+    "escala_amplia": {"sl_pct": -0.02, "tp1_pct": 0.01, "tp1_peso": 0.40,
+        "tp2_pct": 0.016, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.01, "stop_tras_tp2_pct": -0.01},
+    "escala_xl": {"sl_pct": -0.03, "tp1_pct": 0.015, "tp1_peso": 0.40,
+        "tp2_pct": 0.025, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.015, "stop_tras_tp2_pct": -0.015},
+    "escala_xxl": {"sl_pct": -0.04, "tp1_pct": 0.02, "tp1_peso": 0.40,
+        "tp2_pct": 0.035, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.02, "stop_tras_tp2_pct": -0.02},
+    "sin_breakeven": {"sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
+        "tp2_pct": 0.008, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.005, "stop_tras_tp2_pct": -0.005},
 }
 
 _cache = {}
@@ -135,31 +127,22 @@ def estadisticas_pendientes(pendientes):
 def detectar_apogeo_y_giro(pendientes, percentiles):
     if percentiles is None or len(pendientes) < 3:
         return None
-
     p90 = percentiles["percentil_90"]
     p10 = percentiles["percentil_10"]
     actual = float(pendientes[-1])
     anterior = float(pendientes[-2])
-
     en_apogeo_alcista = actual >= p90
     en_apogeo_bajista = actual <= p10
-
     retroceso_desde_max = None
     retroceso_desde_min = None
-
     ventana = min(20, len(pendientes))
     max_reciente = float(np.max(pendientes[-ventana:]))
     min_reciente = float(np.min(pendientes[-ventana:]))
-
     if max_reciente > 0 and actual < max_reciente:
         retroceso_desde_max = round((max_reciente - actual) / abs(max_reciente), 4)
     if min_reciente < 0 and actual > min_reciente:
         retroceso_desde_min = round((actual - min_reciente) / abs(min_reciente), 4)
-
-    percentil_actual = float(
-        np.searchsorted(np.sort(pendientes), actual) / len(pendientes) * 100
-    )
-
+    percentil_actual = float(np.searchsorted(np.sort(pendientes), actual) / len(pendientes) * 100)
     return {
         "pendiente_actual": round(actual, 8),
         "pendiente_anterior": round(anterior, 8),
@@ -180,17 +163,14 @@ def obtener_direccion_4h(symbol, timestamps_senales):
     closes_4h = np.array([float(k[4]) for k in raw_4h])
     open_times_4h = [int(k[0]) for k in raw_4h]
     close_times_4h = [int(k[6]) for k in raw_4h]
-
     macd_4h, _, _ = calcular_macd(closes_4h)
     pendientes_4h = calcular_pendientes(macd_4h)
-
     direccion_por_ts = {}
     for ts_str in timestamps_senales:
         if ts_str is None:
             continue
         ts_dt = datetime.fromisoformat(ts_str)
         ts_ms = int(ts_dt.timestamp() * 1000)
-
         dir_4h = "lateral"
         for j in range(len(open_times_4h)):
             if open_times_4h[j] <= ts_ms <= close_times_4h[j]:
@@ -204,74 +184,118 @@ def obtener_direccion_4h(symbol, timestamps_senales):
                             dir_4h = "bajista"
                 break
         direccion_por_ts[ts_str] = dir_4h
-
     return direccion_por_ts
 
 
-def simular_senales(pendientes, closes, timestamps, percentiles, umbral):
+def simular_senales_percentiles(pendientes, closes, timestamps, percentiles, umbral):
+    """Lógica ORIGINAL: apogeo en P90/P10 + retroceso del umbral%"""
     if percentiles is None or len(pendientes) < 30:
         return []
-
     senales = []
     p90 = percentiles["percentil_90"]
     p10 = percentiles["percentil_10"]
-
     en_apogeo_alcista = False
     max_pendiente_alcista = 0.0
     en_apogeo_bajista = False
     min_pendiente_bajista = 0.0
     ultima_senal_idx = -30
-
     for i in range(1, len(pendientes)):
         p = float(pendientes[i])
-
         if p >= p90:
             en_apogeo_alcista = True
             max_pendiente_alcista = max(max_pendiente_alcista, p)
-
         if p <= p10:
             en_apogeo_bajista = True
             min_pendiente_bajista = min(min_pendiente_bajista, p)
-
         if en_apogeo_alcista and max_pendiente_alcista > 0:
             retroceso = (max_pendiente_alcista - p) / abs(max_pendiente_alcista)
             if retroceso >= umbral and (i - ultima_senal_idx) >= 6:
                 precio_idx = i + 1
                 if precio_idx < len(closes):
                     senales.append({
-                        "tipo": "SHORT",
-                        "motivo": "giro_bajista_desde_apogeo",
+                        "tipo": "SHORT", "motivo": "giro_bajista_desde_apogeo",
                         "vela_idx": int(precio_idx),
                         "precio": round(float(closes[precio_idx]), 6),
                         "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
-                        "pendiente_en_giro": round(p, 8),
-                        "max_pendiente": round(max_pendiente_alcista, 8),
-                        "retroceso_pct": round(float(retroceso), 4),
                         "umbral_usado": float(umbral),
                     })
                     ultima_senal_idx = i
                 en_apogeo_alcista = False
                 max_pendiente_alcista = 0.0
-
         if en_apogeo_bajista and min_pendiente_bajista < 0:
             retroceso = (p - min_pendiente_bajista) / abs(min_pendiente_bajista)
             if retroceso >= umbral and (i - ultima_senal_idx) >= 6:
                 precio_idx = i + 1
                 if precio_idx < len(closes):
                     senales.append({
-                        "tipo": "LONG",
-                        "motivo": "giro_alcista_desde_apogeo",
+                        "tipo": "LONG", "motivo": "giro_alcista_desde_apogeo",
                         "vela_idx": int(precio_idx),
                         "precio": round(float(closes[precio_idx]), 6),
                         "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
-                        "pendiente_en_giro": round(p, 8),
-                        "min_pendiente": round(min_pendiente_bajista, 8),
-                        "retroceso_pct": round(float(retroceso), 4),
                         "umbral_usado": float(umbral),
                     })
                     ultima_senal_idx = i
                 en_apogeo_bajista = False
                 min_pendiente_bajista = 0.0
+    return senales
+
+
+def simular_senales_simple(pendientes, closes, timestamps, gap_min=6, min_racha=3):
+    """
+    Lógica SIMPLIFICADA: cambio de signo de la pendiente.
+
+    - Giro alcista: pendiente pasa de negativa a positiva (cruce hacia arriba)
+    - Giro bajista: pendiente pasa de positiva a negativa (cruce hacia abajo)
+    - min_racha: número mínimo de velas consecutivas en la dirección anterior
+                 antes del cruce (para evitar señales en flat)
+    - gap_min: mínimo de velas entre señales
+
+    Esta lógica es PORTABLE a Pine Script sin repintado.
+    """
+    if len(pendientes) < min_racha + 2:
+        return []
+
+    senales = []
+    ultima_senal_idx = -30
+
+    for i in range(min_racha + 1, len(pendientes)):
+        p_actual = float(pendientes[i])
+        p_prev = float(pendientes[i - 1])
+
+        # Comprobar racha previa
+        racha_neg = all(float(pendientes[i - k - 1]) < 0 for k in range(min_racha))
+        racha_pos = all(float(pendientes[i - k - 1]) > 0 for k in range(min_racha))
+
+        if (i - ultima_senal_idx) < gap_min:
+            continue
+
+        # Giro alcista: pendiente negativa pasa a positiva tras racha negativa
+        if racha_neg and p_prev < 0 and p_actual > 0:
+            precio_idx = i + 1
+            if precio_idx < len(closes):
+                senales.append({
+                    "tipo": "LONG",
+                    "motivo": "cambio_signo_a_positivo",
+                    "vela_idx": int(precio_idx),
+                    "precio": round(float(closes[precio_idx]), 6),
+                    "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
+                    "min_racha": int(min_racha),
+                })
+                ultima_senal_idx = i
+
+        # Giro bajista: pendiente positiva pasa a negativa tras racha positiva
+        elif racha_pos and p_prev > 0 and p_actual < 0:
+            precio_idx = i + 1
+            if precio_idx < len(closes):
+                senales.append({
+                    "tipo": "SHORT",
+                    "motivo": "cambio_signo_a_negativo",
+                    "vela_idx": int(precio_idx),
+                    "precio": round(float(closes[precio_idx]), 6),
+                    "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
+                    "min_racha": int(min_racha),
+                })
+                ultima_senal_idx = i
 
     return senales
 
@@ -308,17 +332,18 @@ def evaluar_senales(senales, closes, n_velas_futuras=20):
         mejor_pct = dir_mult * (mejor_precio - entrada) / entrada * 100
         cierre_20v = float(closes[idx + n_velas_futuras])
         resultado_20v = dir_mult * (cierre_20v - entrada) / entrada * 100
-
         resultado = {
-            "tipo": s["tipo"],
-            "precio": s["precio"],
-            "timestamp": s["timestamp"],
+            "tipo": s["tipo"], "precio": s["precio"], "timestamp": s["timestamp"],
             "mejor_pct_20v": round(float(mejor_pct), 3),
             "resultado_20v_pct": round(float(resultado_20v), 3),
             "ganadora_20v": bool(resultado_20v > 0),
         }
         if "direccion_4h" in s:
             resultado["direccion_4h"] = s["direccion_4h"]
+        if "min_racha" in s:
+            resultado["min_racha"] = s["min_racha"]
+        if "umbral_usado" in s:
+            resultado["umbral_usado"] = s["umbral_usado"]
         resultados.append(resultado)
     return resultados
 
@@ -344,58 +369,32 @@ def simular_trade_sltp(senal, closes_validas, cfg):
         return None
     es_long = senal["tipo"] == "LONG"
     dir_mult = 1.0 if es_long else -1.0
-
     sl = cfg["sl_pct"]
-    tp1 = cfg["tp1_pct"]
-    tp1_peso = cfg["tp1_peso"]
-    tp2 = cfg["tp2_pct"]
-    tp2_peso = cfg["tp2_peso"]
-    be1 = cfg["stop_tras_tp1_pct"]
-    be2 = cfg["stop_tras_tp2_pct"]
-
+    tp1 = cfg["tp1_pct"]; tp1_peso = cfg["tp1_peso"]
+    tp2 = cfg["tp2_pct"]; tp2_peso = cfg["tp2_peso"]
+    be1 = cfg["stop_tras_tp1_pct"]; be2 = cfg["stop_tras_tp2_pct"]
     stop_actual = sl
-    fase = 1
-    realizado = 0.0
-    estado = None
-
+    fase = 1; realizado = 0.0; estado = None
     for k_idx in range(idx + 1, len(closes_validas)):
-        # Estimamos high/low usando closes como proxy (no tenemos OHLC de closes_validas)
-        # Usamos el precio de la vela como referencia
         precio_vela = float(closes_validas[k_idx])
         avance = dir_mult * (precio_vela - entrada) / entrada
-
         if fase == 1:
             if avance <= stop_actual:
-                realizado = stop_actual
-                estado = "cerrada_sl"
-                break
+                realizado = stop_actual; estado = "cerrada_sl"; break
             if avance >= tp1:
-                realizado += tp1_peso * tp1
-                fase = 2
-                stop_actual = be1
-
+                realizado += tp1_peso * tp1; fase = 2; stop_actual = be1
         elif fase == 2:
             if avance <= stop_actual:
                 peso_resto = 1 - tp1_peso
-                realizado += peso_resto * stop_actual
-                estado = "cerrada_be1"
-                break
+                realizado += peso_resto * stop_actual; estado = "cerrada_be1"; break
             if avance >= tp2:
-                realizado += tp2_peso * tp2
-                fase = 3
-                stop_actual = be2
-
+                realizado += tp2_peso * tp2; fase = 3; stop_actual = be2
         elif fase == 3:
             if avance <= stop_actual:
                 peso_resto = 1 - tp1_peso - tp2_peso
-                realizado += peso_resto * stop_actual
-                estado = "cerrada_be2"
-                break
-
-        # Máximo 100 velas hacia adelante
+                realizado += peso_resto * stop_actual; estado = "cerrada_be2"; break
         if k_idx - idx >= 100:
             break
-
     if estado is None:
         ultimo = float(closes_validas[min(idx + 100, len(closes_validas) - 1)])
         avance_final = dir_mult * (ultimo - entrada) / entrada
@@ -408,7 +407,6 @@ def simular_trade_sltp(senal, closes_validas, cfg):
         estado = f"abierta_f{fase}"
     else:
         resultado = realizado
-
     return {"estado": estado, "resultado_pct": round(resultado * 100, 3)}
 
 
@@ -416,7 +414,6 @@ def analizar_tf(symbol, tf_label, interval, limit):
     raw = fetch_klines(symbol, interval, limit)
     if len(raw) < MACD_SLOW + MACD_SIGNAL + 10:
         return {"error": "datos_insuficientes"}
-
     closes = np.array([float(k[4]) for k in raw])
     macd_line, signal_line, histogram = calcular_macd(closes)
     pendientes = calcular_pendientes(macd_line)
@@ -424,30 +421,132 @@ def analizar_tf(symbol, tf_label, interval, limit):
     pendientes_validas = pendientes[skip:]
     percentiles = estadisticas_pendientes(pendientes_validas)
     estado = detectar_apogeo_y_giro(pendientes_validas, percentiles)
-
     return {
         "tf": tf_label,
         "macd_actual": round(float(macd_line[-1]), 8),
         "macd_anterior": round(float(macd_line[-2]), 8),
         "signal_actual": round(float(signal_line[-1]), 8),
-        "calibracion": percentiles,
-        "estado": estado,
+        "calibracion": percentiles, "estado": estado,
         "n_velas_analizadas": int(len(pendientes_validas)),
     }
 
 
+def analizar_senales_simple_tf(symbol, tf_label, interval, limit, min_racha=3):
+    """Análisis de la lógica simple por TF"""
+    raw = fetch_klines(symbol, interval, limit)
+    if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
+        return {"error": "datos_insuficientes"}
+    closes = np.array([float(k[4]) for k in raw])
+    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
+    macd_line, _, _ = calcular_macd(closes)
+    pendientes = calcular_pendientes(macd_line)
+    skip = MACD_SLOW + MACD_SIGNAL
+    pendientes_validas = pendientes[skip:]
+    closes_validas = closes[skip + 1:]
+    timestamps_validos = timestamps[skip + 1:]
+
+    senales = simular_senales_simple(pendientes_validas, closes_validas, timestamps_validos, gap_min=6, min_racha=min_racha)
+
+    es_tf_menor = tf_label in ("5m", "15m", "1h")
+    direccion_4h = {}
+    if es_tf_menor:
+        try:
+            all_ts = [s["timestamp"] for s in senales if s["timestamp"]]
+            if all_ts:
+                direccion_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
+        except Exception as e:
+            print(f"Error 4H: {e}")
+
+    evaluadas_sin = evaluar_senales(senales, closes_validas)
+    resumen_sin = resumir_evaluacion(evaluadas_sin)
+    resumen_sin["senales"] = evaluadas_sin[-10:]
+    resultado = {"tf": tf_label, "min_racha": min_racha, "n_velas": int(len(closes)), "sin_filtro": resumen_sin}
+
+    if es_tf_menor and direccion_4h:
+        senales_filtradas = filtrar_por_4h(senales, direccion_4h)
+        evaluadas_filt = evaluar_senales(senales_filtradas, closes_validas)
+        resumen_filt = resumir_evaluacion(evaluadas_filt)
+        resumen_filt["senales"] = evaluadas_filt[-10:]
+        resultado["filtro_4h"] = resumen_filt
+        resultado["filtro_4h_aplicado"] = True
+
+    return resultado
+
+
+def calcular_laboratorio_simple(symbol, tf_label, interval, limit, min_racha=3):
+    """Laboratorio SL/TP usando la lógica simple"""
+    raw = fetch_klines(symbol, interval, limit)
+    if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
+        return {"error": "datos_insuficientes"}
+    closes = np.array([float(k[4]) for k in raw])
+    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
+    macd_line, _, _ = calcular_macd(closes)
+    pendientes = calcular_pendientes(macd_line)
+    skip = MACD_SLOW + MACD_SIGNAL
+    pendientes_validas = pendientes[skip:]
+    closes_validas = closes[skip + 1:]
+    timestamps_validos = timestamps[skip + 1:]
+
+    senales = simular_senales_simple(pendientes_validas, closes_validas, timestamps_validos, gap_min=6, min_racha=min_racha)
+
+    es_tf_menor = tf_label in ("5m", "15m", "1h")
+    if es_tf_menor:
+        try:
+            all_ts = [s["timestamp"] for s in senales if s["timestamp"]]
+            if all_ts:
+                dir_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
+                senales = filtrar_por_4h(senales, dir_4h)
+        except Exception as e:
+            print(f"Error 4H: {e}")
+
+    resultados_por_config = []
+    for nombre, cfg in CONFIGS_LAB.items():
+        valores = []; ganadoras = 0; perdedoras_sl = 0; ganancias = []; perdidas = []
+        for s in senales:
+            r = simular_trade_sltp(s, closes_validas, cfg)
+            if r is None:
+                continue
+            pct = r["resultado_pct"]
+            valores.append(pct)
+            if pct > 0:
+                ganadoras += 1; ganancias.append(pct)
+            else:
+                perdidas.append(pct)
+            if r["estado"] == "cerrada_sl":
+                perdedoras_sl += 1
+        if valores:
+            ganancia_media = round(float(np.mean(ganancias)), 3) if ganancias else 0
+            perdida_media = round(float(np.mean(perdidas)), 3) if perdidas else 0
+            ratio = round(abs(ganancia_media / perdida_media), 2) if perdida_media != 0 else None
+            resultados_por_config.append({
+                "config": nombre, "sl_pct": cfg["sl_pct"] * 100,
+                "tp1_pct": cfg["tp1_pct"] * 100, "tp2_pct": cfg["tp2_pct"] * 100,
+                "n_senales": int(len(valores)),
+                "winrate_pct": round(float(ganadoras / len(valores) * 100), 1),
+                "resultado_medio_pct": round(float(sum(valores) / len(valores)), 3),
+                "ganancia_media_pct": ganancia_media, "perdida_media_pct": perdida_media,
+                "ratio_beneficio_perdida": ratio, "n_stops": int(perdedoras_sl),
+            })
+        else:
+            resultados_por_config.append({"config": nombre, "n_senales": 0})
+
+    resultados_por_config.sort(key=lambda x: x.get("resultado_medio_pct") or -999, reverse=True)
+
+    return {
+        "simbolo": symbol, "tf": tf_label, "logica": "simple_cambio_signo",
+        "min_racha": min_racha, "n_senales_tras_filtro_4h": int(len(senales)),
+        "configs": resultados_por_config,
+    }
+
+
+# Funciones de la lógica de percentiles (mantenemos las del v2.1 sin cambios)
 def analizar_senales_tf(symbol, tf_label, interval, limit):
     raw = fetch_klines(symbol, interval, limit)
     if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
         return {"error": "datos_insuficientes"}
-
     closes = np.array([float(k[4]) for k in raw])
-    timestamps = [
-        datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat()
-        for k in raw
-    ]
-
-    macd_line, signal_line, histogram = calcular_macd(closes)
+    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
+    macd_line, _, _ = calcular_macd(closes)
     pendientes = calcular_pendientes(macd_line)
     skip = MACD_SLOW + MACD_SIGNAL
     pendientes_validas = pendientes[skip:]
@@ -461,51 +560,40 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
         try:
             all_timestamps = []
             for umbral in UMBRALES_GIRO:
-                senales_temp = simular_senales(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral)
+                senales_temp = simular_senales_percentiles(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral)
                 all_timestamps.extend([s["timestamp"] for s in senales_temp if s["timestamp"]])
             all_timestamps = list(set(all_timestamps))
             if all_timestamps:
                 direccion_4h = obtener_direccion_4h(symbol, all_timestamps)
         except Exception as e:
-            print(f"Error dirección 4H: {e}")
+            print(f"Error 4H: {e}")
 
     resultados_por_umbral = {}
     for umbral in UMBRALES_GIRO:
-        senales = simular_senales(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral)
-        evaluadas_sin_filtro = evaluar_senales(senales, closes_validas)
-        resumen_sin_filtro = resumir_evaluacion(evaluadas_sin_filtro)
-        resumen_sin_filtro["senales"] = evaluadas_sin_filtro[-10:]
-
-        resultado_umbral = {"umbral": float(umbral), "sin_filtro": resumen_sin_filtro}
-
+        senales = simular_senales_percentiles(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral)
+        evaluadas_sin = evaluar_senales(senales, closes_validas)
+        resumen_sin = resumir_evaluacion(evaluadas_sin)
+        resumen_sin["senales"] = evaluadas_sin[-10:]
+        resultado_umbral = {"umbral": float(umbral), "sin_filtro": resumen_sin}
         if es_tf_menor and direccion_4h:
-            senales_filtradas = filtrar_por_4h(senales, direccion_4h)
-            evaluadas_filtradas = evaluar_senales(senales_filtradas, closes_validas)
-            resumen_filtrado = resumir_evaluacion(evaluadas_filtradas)
-            resumen_filtrado["senales"] = evaluadas_filtradas[-10:]
-            resultado_umbral["filtro_4h"] = resumen_filtrado
-
+            senales_filt = filtrar_por_4h(senales, direccion_4h)
+            evaluadas_filt = evaluar_senales(senales_filt, closes_validas)
+            resumen_filt = resumir_evaluacion(evaluadas_filt)
+            resumen_filt["senales"] = evaluadas_filt[-10:]
+            resultado_umbral["filtro_4h"] = resumen_filt
         resultados_por_umbral[str(umbral)] = resultado_umbral
 
-    return {
-        "tf": tf_label,
-        "n_velas": int(len(closes)),
+    return {"tf": tf_label, "n_velas": int(len(closes)),
         "filtro_4h_aplicado": bool(es_tf_menor and direccion_4h),
-        "umbrales": resultados_por_umbral,
-    }
+        "umbrales": resultados_por_umbral}
 
 
 def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
     raw = fetch_klines(symbol, interval, limit)
     if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
         return {"error": "datos_insuficientes"}
-
     closes = np.array([float(k[4]) for k in raw])
-    timestamps = [
-        datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat()
-        for k in raw
-    ]
-
+    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
     macd_line, _, _ = calcular_macd(closes)
     pendientes = calcular_pendientes(macd_line)
     skip = MACD_SLOW + MACD_SIGNAL
@@ -513,8 +601,7 @@ def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
     closes_validas = closes[skip + 1:]
     timestamps_validos = timestamps[skip + 1:]
     percentiles = estadisticas_pendientes(pendientes_validas)
-
-    senales = simular_senales(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral_fijo)
+    senales = simular_senales_percentiles(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral_fijo)
 
     es_tf_menor = tf_label in ("5m", "15m", "1h")
     if es_tf_menor:
@@ -524,16 +611,11 @@ def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
                 dir_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
                 senales = filtrar_por_4h(senales, dir_4h)
         except Exception as e:
-            print(f"Error 4H en laboratorio: {e}")
+            print(f"Error 4H: {e}")
 
     resultados_por_config = []
     for nombre, cfg in CONFIGS_LAB.items():
-        valores = []
-        ganadoras = 0
-        perdedoras_sl = 0
-        ganancias = []
-        perdidas = []
-
+        valores = []; ganadoras = 0; perdedoras_sl = 0; ganancias = []; perdidas = []
         for s in senales:
             r = simular_trade_sltp(s, closes_validas, cfg)
             if r is None:
@@ -541,64 +623,57 @@ def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
             pct = r["resultado_pct"]
             valores.append(pct)
             if pct > 0:
-                ganadoras += 1
-                ganancias.append(pct)
+                ganadoras += 1; ganancias.append(pct)
             else:
                 perdidas.append(pct)
             if r["estado"] == "cerrada_sl":
                 perdedoras_sl += 1
-
         if valores:
             ganancia_media = round(float(np.mean(ganancias)), 3) if ganancias else 0
             perdida_media = round(float(np.mean(perdidas)), 3) if perdidas else 0
             ratio = round(abs(ganancia_media / perdida_media), 2) if perdida_media != 0 else None
             resultados_por_config.append({
-                "config": nombre,
-                "sl_pct": cfg["sl_pct"] * 100,
-                "tp1_pct": cfg["tp1_pct"] * 100,
-                "tp2_pct": cfg["tp2_pct"] * 100,
+                "config": nombre, "sl_pct": cfg["sl_pct"] * 100,
+                "tp1_pct": cfg["tp1_pct"] * 100, "tp2_pct": cfg["tp2_pct"] * 100,
                 "n_senales": int(len(valores)),
                 "winrate_pct": round(float(ganadoras / len(valores) * 100), 1),
                 "resultado_medio_pct": round(float(sum(valores) / len(valores)), 3),
-                "ganancia_media_pct": ganancia_media,
-                "perdida_media_pct": perdida_media,
-                "ratio_beneficio_perdida": ratio,
-                "n_stops": int(perdedoras_sl),
+                "ganancia_media_pct": ganancia_media, "perdida_media_pct": perdida_media,
+                "ratio_beneficio_perdida": ratio, "n_stops": int(perdedoras_sl),
             })
         else:
-            resultados_por_config.append({
-                "config": nombre, "n_senales": 0,
-                "winrate_pct": None, "resultado_medio_pct": None,
-                "ratio_beneficio_perdida": None,
-            })
-
+            resultados_por_config.append({"config": nombre, "n_senales": 0})
     resultados_por_config.sort(key=lambda x: x.get("resultado_medio_pct") or -999, reverse=True)
-
     return {
-        "simbolo": symbol,
-        "tf": tf_label,
+        "simbolo": symbol, "tf": tf_label, "logica": "percentiles",
         "umbral_usado": float(umbral_fijo),
         "n_senales_tras_filtro_4h": int(len(senales)),
         "configs": resultados_por_config,
     }
 
 
+# ============================================================
+# ENDPOINTS
+# ============================================================
 @app.route("/")
 def home():
     return jsonify({
         "servicio": "PCELER — Acelerómetro PALMERO",
-        "version": "2.1",
-        "novedad": "Laboratorio SL/TP integrado — encuentra la gestión óptima para las señales del Acelerómetro",
-        "endpoints": [
-            "/estado/<symbol>",
-            "/estado/<symbol>/<tf>",
+        "version": "2.2",
+        "novedad": "Lógica SIMPLE (cambio de signo) en paralelo a la de percentiles",
+        "endpoints_percentiles": [
+            "/estado/<symbol>", "/estado/<symbol>/<tf>",
             "/calibracion/<symbol>",
-            "/senales/<symbol>",
             "/senales/<symbol>/<tf>",
-            "/laboratorio/<symbol>/<tf> — evalúa señales del Acelerómetro con todas las configs SL/TP",
-            "/laboratorio/<symbol>/<tf>/<umbral> — idem con umbral específico (ej: /laboratorio/XRPUSDT/15m/0.25)",
-            "/t/<bust>",
+            "/laboratorio/<symbol>/<tf>/<umbral>",
         ],
+        "endpoints_simple": [
+            "/senales_simple/<symbol>/<tf>",
+            "/senales_simple/<symbol>/<tf>/<min_racha>",
+            "/laboratorio_simple/<symbol>/<tf>",
+            "/laboratorio_simple/<symbol>/<tf>/<min_racha>",
+        ],
+        "comparativa": "/comparativa/<symbol>/<tf> — los dos métodos lado a lado",
     })
 
 
@@ -618,8 +693,7 @@ def estado_symbol(symbol):
 
 @app.route("/estado/<symbol>/<tf>")
 def estado_symbol_tf(symbol, tf):
-    symbol = symbol.upper()
-    tf = tf.lower()
+    symbol = symbol.upper(); tf = tf.lower()
     if symbol not in SYMBOLS:
         return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     if tf not in TIMEFRAMES:
@@ -658,24 +732,9 @@ def calibracion_symbol(symbol):
     return jsonify(resultado)
 
 
-@app.route("/senales/<symbol>")
-def senales_symbol(symbol):
-    symbol = symbol.upper()
-    if symbol not in SYMBOLS:
-        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
-    resultado = {"simbolo": symbol, "timestamp_utc": datetime.now(timezone.utc).isoformat(), "timeframes": {}}
-    for label, cfg in TIMEFRAMES.items():
-        try:
-            resultado["timeframes"][label] = analizar_senales_tf(symbol, label, cfg["interval"], cfg["limit"])
-        except Exception as e:
-            resultado["timeframes"][label] = {"error": str(e)}
-    return jsonify(resultado)
-
-
 @app.route("/senales/<symbol>/<tf>")
 def senales_symbol_tf(symbol, tf):
-    symbol = symbol.upper()
-    tf = tf.lower()
+    symbol = symbol.upper(); tf = tf.lower()
     if symbol not in SYMBOLS:
         return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     if tf not in TIMEFRAMES:
@@ -688,10 +747,29 @@ def senales_symbol_tf(symbol, tf):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/senales_simple/<symbol>/<tf>")
+@app.route("/senales_simple/<symbol>/<tf>/<min_racha>")
+def senales_simple_endpoint(symbol, tf, min_racha=3):
+    symbol = symbol.upper(); tf = tf.lower()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    if tf not in TIMEFRAMES:
+        return jsonify({"error": f"TF no soportado: {tf}"}), 400
+    try:
+        min_racha = int(min_racha)
+    except ValueError:
+        return jsonify({"error": "min_racha debe ser entero"}), 400
+    cfg = TIMEFRAMES[tf]
+    try:
+        data = analizar_senales_simple_tf(symbol, tf, cfg["interval"], cfg["limit"], min_racha=min_racha)
+        return jsonify({"simbolo": symbol, "timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/laboratorio/<symbol>/<tf>")
-def laboratorio_tf(symbol, tf):
-    symbol = symbol.upper()
-    tf = tf.lower()
+def laboratorio_tf_default(symbol, tf):
+    symbol = symbol.upper(); tf = tf.lower()
     if symbol not in SYMBOLS:
         return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     if tf not in TIMEFRAMES:
@@ -706,8 +784,7 @@ def laboratorio_tf(symbol, tf):
 
 @app.route("/laboratorio/<symbol>/<tf>/<umbral>")
 def laboratorio_tf_umbral(symbol, tf, umbral):
-    symbol = symbol.upper()
-    tf = tf.lower()
+    symbol = symbol.upper(); tf = tf.lower()
     if symbol not in SYMBOLS:
         return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
     if tf not in TIMEFRAMES:
@@ -715,11 +792,71 @@ def laboratorio_tf_umbral(symbol, tf, umbral):
     try:
         umbral_f = float(umbral)
     except ValueError:
-        return jsonify({"error": "umbral debe ser un número (ej: 0.25)"}), 400
+        return jsonify({"error": "umbral debe ser un número"}), 400
     cfg = TIMEFRAMES[tf]
     try:
         data = calcular_laboratorio(symbol, tf, cfg["interval"], cfg["limit"], umbral_fijo=umbral_f)
         return jsonify({"timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/laboratorio_simple/<symbol>/<tf>")
+@app.route("/laboratorio_simple/<symbol>/<tf>/<min_racha>")
+def laboratorio_simple_endpoint(symbol, tf, min_racha=3):
+    symbol = symbol.upper(); tf = tf.lower()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    if tf not in TIMEFRAMES:
+        return jsonify({"error": f"TF no soportado: {tf}"}), 400
+    try:
+        min_racha = int(min_racha)
+    except ValueError:
+        return jsonify({"error": "min_racha debe ser entero"}), 400
+    cfg = TIMEFRAMES[tf]
+    try:
+        data = calcular_laboratorio_simple(symbol, tf, cfg["interval"], cfg["limit"], min_racha=min_racha)
+        return jsonify({"timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/comparativa/<symbol>/<tf>")
+def comparativa(symbol, tf):
+    """Compara lado a lado lógica de percentiles vs lógica simple, ambas con escala_xl"""
+    symbol = symbol.upper(); tf = tf.lower()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    if tf not in TIMEFRAMES:
+        return jsonify({"error": f"TF no soportado: {tf}"}), 400
+    cfg = TIMEFRAMES[tf]
+    try:
+        lab_perc = calcular_laboratorio(symbol, tf, cfg["interval"], cfg["limit"], umbral_fijo=0.25)
+        lab_simple = calcular_laboratorio_simple(symbol, tf, cfg["interval"], cfg["limit"], min_racha=3)
+
+        # Extraer solo escala_xl de cada uno para comparar directo
+        def get_xl(lab):
+            for c in lab.get("configs", []):
+                if c.get("config") == "escala_xl":
+                    return c
+            return None
+
+        return jsonify({
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "simbolo": symbol, "tf": tf,
+            "logica_percentiles": {
+                "umbral_usado": 0.25,
+                "n_senales": lab_perc.get("n_senales_tras_filtro_4h"),
+                "escala_xl": get_xl(lab_perc),
+                "todas_configs": lab_perc.get("configs", []),
+            },
+            "logica_simple": {
+                "min_racha": 3,
+                "n_senales": lab_simple.get("n_senales_tras_filtro_4h"),
+                "escala_xl": get_xl(lab_simple),
+                "todas_configs": lab_simple.get("configs", []),
+            },
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
