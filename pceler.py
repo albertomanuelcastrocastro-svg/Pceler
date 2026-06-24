@@ -1,8 +1,9 @@
 """
-PCELER — Acelerómetro PALMERO (v2.2)
+PCELER — Acelerómetro PALMERO (v2.3)
 ========================================
+v2.3: añade MONITOR automático — graba cada señal en vivo a GitHub
+      (pceler_signals_log.json) para auditoría de escala_amplia vs escala_xl.
 v2.2: añade lógica SIMPLIFICADA en paralelo a la de percentiles.
-
 Lógica simplificada:
   - Giro alcista: pendiente del MACD 15M pasa de negativa a positiva
     (sign change up)
@@ -10,43 +11,36 @@ Lógica simplificada:
     (sign change down)
   - Filtro 4H igual: solo LONGs cuando 4H sube, SHORTs cuando baja
   - Anti-spam: gap mínimo entre señales
-
 Esta lógica es PORTABLE a Pine Script sin riesgo de repintado.
 Si los resultados son similares a la lógica de percentiles, será la
 elegida para el indicador de TradingView.
 """
-
 import os
 import time
 import requests
 import numpy as np
 from datetime import datetime, timezone
+import threading
+import json
+import base64
 from flask import Flask, jsonify
-
 app = Flask(__name__)
-
 @app.after_request
 def no_cache(response):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
-
 SYMBOLS = ["XRPUSDT", "SOLUSDT"]
 BINANCE_BASE = "https://data-api.binance.vision/api/v3/klines"
-
 TIMEFRAMES = {
     "5m": {"interval": "5m", "limit": 500},
     "15m": {"interval": "15m", "limit": 500},
     "1h": {"interval": "1h", "limit": 500},
     "4h": {"interval": "4h", "limit": 500},
 }
-
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-
 UMBRALES_GIRO = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
-
-# Configuraciones de SL/TP
 CONFIGS_LAB = {
     "actual": {"sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
         "tp2_pct": 0.008, "tp2_peso": 0.30, "stop_tras_tp1_pct": 0.0, "stop_tras_tp2_pct": 0.0},
@@ -62,10 +56,18 @@ CONFIGS_LAB = {
         "tp2_pct": 0.008, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.005, "stop_tras_tp2_pct": -0.005},
 }
 
+# ─── MONITOR: config para grabación automática de señales ───
+GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GH_REPO = os.environ.get("PCELER_LOG_REPO", "albertomanuelcastrocastro-svg/palmero-bot-pytho")
+GH_LOG_FILE = "pceler_signals_log.json"
+MONITOR_INTERVAL = 960  # 16 minutos (> 1 vela de 15m)
+MONITOR_TF = "15m"
+MONITOR_UMBRAL = 0.25
+_logged_timestamps = set()  # timestamps ya registrados (en memoria)
+_monitor_initialized = False
+
 _cache = {}
 _cache_ttl = 30
-
-
 def fetch_klines(symbol, interval, limit=500):
     key = (symbol, interval, limit)
     now = time.time()
@@ -77,8 +79,6 @@ def fetch_klines(symbol, interval, limit=500):
     raw = resp.json()
     _cache[key] = {"ts": now, "data": raw}
     return raw
-
-
 def ema(values, period):
     alpha = 2 / (period + 1)
     result = np.zeros_like(values, dtype=float)
@@ -86,8 +86,6 @@ def ema(values, period):
     for i in range(1, len(values)):
         result[i] = alpha * values[i] + (1 - alpha) * result[i - 1]
     return result
-
-
 def calcular_macd(closes):
     ema_fast = ema(closes, MACD_FAST)
     ema_slow = ema(closes, MACD_SLOW)
@@ -95,16 +93,10 @@ def calcular_macd(closes):
     signal_line = ema(macd_line, MACD_SIGNAL)
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
-
-
 def calcular_pendientes(macd_line):
     return np.diff(macd_line)
-
-
 def calcular_aceleracion(pendientes):
     return np.diff(pendientes)
-
-
 def estadisticas_pendientes(pendientes):
     if len(pendientes) < 10:
         return None
@@ -122,8 +114,6 @@ def estadisticas_pendientes(pendientes):
         "percentil_90": round(float(np.percentile(pendientes, 90)), 8),
         "percentil_95": round(float(np.percentile(pendientes, 95)), 8),
     }
-
-
 def detectar_apogeo_y_giro(pendientes, percentiles):
     if percentiles is None or len(pendientes) < 3:
         return None
@@ -156,8 +146,6 @@ def detectar_apogeo_y_giro(pendientes, percentiles):
         "retroceso_desde_min_pct": retroceso_desde_min,
         "percentil_actual": round(percentil_actual, 1),
     }
-
-
 def obtener_direccion_4h(symbol, timestamps_senales):
     raw_4h = fetch_klines(symbol, "4h", 500)
     closes_4h = np.array([float(k[4]) for k in raw_4h])
@@ -185,10 +173,7 @@ def obtener_direccion_4h(symbol, timestamps_senales):
                 break
         direccion_por_ts[ts_str] = dir_4h
     return direccion_por_ts
-
-
 def simular_senales_percentiles(pendientes, closes, timestamps, percentiles, umbral):
-    """Lógica ORIGINAL: apogeo en P90/P10 + retroceso del umbral%"""
     if percentiles is None or len(pendientes) < 30:
         return []
     senales = []
@@ -238,68 +223,41 @@ def simular_senales_percentiles(pendientes, closes, timestamps, percentiles, umb
                 en_apogeo_bajista = False
                 min_pendiente_bajista = 0.0
     return senales
-
-
 def simular_senales_simple(pendientes, closes, timestamps, gap_min=6, min_racha=3):
-    """
-    Lógica SIMPLIFICADA: cambio de signo de la pendiente.
-
-    - Giro alcista: pendiente pasa de negativa a positiva (cruce hacia arriba)
-    - Giro bajista: pendiente pasa de positiva a negativa (cruce hacia abajo)
-    - min_racha: número mínimo de velas consecutivas en la dirección anterior
-                 antes del cruce (para evitar señales en flat)
-    - gap_min: mínimo de velas entre señales
-
-    Esta lógica es PORTABLE a Pine Script sin repintado.
-    """
     if len(pendientes) < min_racha + 2:
         return []
-
     senales = []
     ultima_senal_idx = -30
-
     for i in range(min_racha + 1, len(pendientes)):
         p_actual = float(pendientes[i])
         p_prev = float(pendientes[i - 1])
-
-        # Comprobar racha previa
         racha_neg = all(float(pendientes[i - k - 1]) < 0 for k in range(min_racha))
         racha_pos = all(float(pendientes[i - k - 1]) > 0 for k in range(min_racha))
-
         if (i - ultima_senal_idx) < gap_min:
             continue
-
-        # Giro alcista: pendiente negativa pasa a positiva tras racha negativa
         if racha_neg and p_prev < 0 and p_actual > 0:
             precio_idx = i + 1
             if precio_idx < len(closes):
                 senales.append({
-                    "tipo": "LONG",
-                    "motivo": "cambio_signo_a_positivo",
+                    "tipo": "LONG", "motivo": "cambio_signo_a_positivo",
                     "vela_idx": int(precio_idx),
                     "precio": round(float(closes[precio_idx]), 6),
                     "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
                     "min_racha": int(min_racha),
                 })
                 ultima_senal_idx = i
-
-        # Giro bajista: pendiente positiva pasa a negativa tras racha positiva
         elif racha_pos and p_prev > 0 and p_actual < 0:
             precio_idx = i + 1
             if precio_idx < len(closes):
                 senales.append({
-                    "tipo": "SHORT",
-                    "motivo": "cambio_signo_a_negativo",
+                    "tipo": "SHORT", "motivo": "cambio_signo_a_negativo",
                     "vela_idx": int(precio_idx),
                     "precio": round(float(closes[precio_idx]), 6),
                     "timestamp": timestamps[precio_idx] if precio_idx < len(timestamps) else None,
                     "min_racha": int(min_racha),
                 })
                 ultima_senal_idx = i
-
     return senales
-
-
 def filtrar_por_4h(senales, direccion_4h):
     filtradas = []
     for s in senales:
@@ -313,8 +271,6 @@ def filtrar_por_4h(senales, direccion_4h):
         elif s["tipo"] == "SHORT" and dir_4h == "bajista":
             filtradas.append(s)
     return filtradas
-
-
 def evaluar_senales(senales, closes, n_velas_futuras=20):
     resultados = []
     for s in senales:
@@ -346,8 +302,6 @@ def evaluar_senales(senales, closes, n_velas_futuras=20):
             resultado["umbral_usado"] = s["umbral_usado"]
         resultados.append(resultado)
     return resultados
-
-
 def resumir_evaluacion(evaluadas):
     if not evaluadas:
         return {"n_senales": 0, "winrate_pct": None, "resultado_medio_pct": None, "mejor_medio_pct": None}
@@ -358,8 +312,6 @@ def resumir_evaluacion(evaluadas):
         "resultado_medio_pct": round(float(sum(s["resultado_20v_pct"] for s in evaluadas) / len(evaluadas)), 3),
         "mejor_medio_pct": round(float(sum(s["mejor_pct_20v"] for s in evaluadas) / len(evaluadas)), 3),
     }
-
-
 def simular_trade_sltp(senal, closes_validas, cfg):
     idx = senal["vela_idx"]
     if idx >= len(closes_validas):
@@ -369,12 +321,10 @@ def simular_trade_sltp(senal, closes_validas, cfg):
         return None
     es_long = senal["tipo"] == "LONG"
     dir_mult = 1.0 if es_long else -1.0
-    sl = cfg["sl_pct"]
-    tp1 = cfg["tp1_pct"]; tp1_peso = cfg["tp1_peso"]
+    sl = cfg["sl_pct"]; tp1 = cfg["tp1_pct"]; tp1_peso = cfg["tp1_peso"]
     tp2 = cfg["tp2_pct"]; tp2_peso = cfg["tp2_peso"]
     be1 = cfg["stop_tras_tp1_pct"]; be2 = cfg["stop_tras_tp2_pct"]
-    stop_actual = sl
-    fase = 1; realizado = 0.0; estado = None
+    stop_actual = sl; fase = 1; realizado = 0.0; estado = None
     for k_idx in range(idx + 1, len(closes_validas)):
         precio_vela = float(closes_validas[k_idx])
         avance = dir_mult * (precio_vela - entrada) / entrada
@@ -408,8 +358,6 @@ def simular_trade_sltp(senal, closes_validas, cfg):
     else:
         resultado = realizado
     return {"estado": estado, "resultado_pct": round(resultado * 100, 3)}
-
-
 def analizar_tf(symbol, tf_label, interval, limit):
     raw = fetch_klines(symbol, interval, limit)
     if len(raw) < MACD_SLOW + MACD_SIGNAL + 10:
@@ -429,117 +377,6 @@ def analizar_tf(symbol, tf_label, interval, limit):
         "calibracion": percentiles, "estado": estado,
         "n_velas_analizadas": int(len(pendientes_validas)),
     }
-
-
-def analizar_senales_simple_tf(symbol, tf_label, interval, limit, min_racha=3):
-    """Análisis de la lógica simple por TF"""
-    raw = fetch_klines(symbol, interval, limit)
-    if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
-        return {"error": "datos_insuficientes"}
-    closes = np.array([float(k[4]) for k in raw])
-    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
-    macd_line, _, _ = calcular_macd(closes)
-    pendientes = calcular_pendientes(macd_line)
-    skip = MACD_SLOW + MACD_SIGNAL
-    pendientes_validas = pendientes[skip:]
-    closes_validas = closes[skip + 1:]
-    timestamps_validos = timestamps[skip + 1:]
-
-    senales = simular_senales_simple(pendientes_validas, closes_validas, timestamps_validos, gap_min=6, min_racha=min_racha)
-
-    es_tf_menor = tf_label in ("5m", "15m", "1h")
-    direccion_4h = {}
-    if es_tf_menor:
-        try:
-            all_ts = [s["timestamp"] for s in senales if s["timestamp"]]
-            if all_ts:
-                direccion_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
-        except Exception as e:
-            print(f"Error 4H: {e}")
-
-    evaluadas_sin = evaluar_senales(senales, closes_validas)
-    resumen_sin = resumir_evaluacion(evaluadas_sin)
-    resumen_sin["senales"] = evaluadas_sin[-10:]
-    resultado = {"tf": tf_label, "min_racha": min_racha, "n_velas": int(len(closes)), "sin_filtro": resumen_sin}
-
-    if es_tf_menor and direccion_4h:
-        senales_filtradas = filtrar_por_4h(senales, direccion_4h)
-        evaluadas_filt = evaluar_senales(senales_filtradas, closes_validas)
-        resumen_filt = resumir_evaluacion(evaluadas_filt)
-        resumen_filt["senales"] = evaluadas_filt[-10:]
-        resultado["filtro_4h"] = resumen_filt
-        resultado["filtro_4h_aplicado"] = True
-
-    return resultado
-
-
-def calcular_laboratorio_simple(symbol, tf_label, interval, limit, min_racha=3):
-    """Laboratorio SL/TP usando la lógica simple"""
-    raw = fetch_klines(symbol, interval, limit)
-    if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
-        return {"error": "datos_insuficientes"}
-    closes = np.array([float(k[4]) for k in raw])
-    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
-    macd_line, _, _ = calcular_macd(closes)
-    pendientes = calcular_pendientes(macd_line)
-    skip = MACD_SLOW + MACD_SIGNAL
-    pendientes_validas = pendientes[skip:]
-    closes_validas = closes[skip + 1:]
-    timestamps_validos = timestamps[skip + 1:]
-
-    senales = simular_senales_simple(pendientes_validas, closes_validas, timestamps_validos, gap_min=6, min_racha=min_racha)
-
-    es_tf_menor = tf_label in ("5m", "15m", "1h")
-    if es_tf_menor:
-        try:
-            all_ts = [s["timestamp"] for s in senales if s["timestamp"]]
-            if all_ts:
-                dir_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
-                senales = filtrar_por_4h(senales, dir_4h)
-        except Exception as e:
-            print(f"Error 4H: {e}")
-
-    resultados_por_config = []
-    for nombre, cfg in CONFIGS_LAB.items():
-        valores = []; ganadoras = 0; perdedoras_sl = 0; ganancias = []; perdidas = []
-        for s in senales:
-            r = simular_trade_sltp(s, closes_validas, cfg)
-            if r is None:
-                continue
-            pct = r["resultado_pct"]
-            valores.append(pct)
-            if pct > 0:
-                ganadoras += 1; ganancias.append(pct)
-            else:
-                perdidas.append(pct)
-            if r["estado"] == "cerrada_sl":
-                perdedoras_sl += 1
-        if valores:
-            ganancia_media = round(float(np.mean(ganancias)), 3) if ganancias else 0
-            perdida_media = round(float(np.mean(perdidas)), 3) if perdidas else 0
-            ratio = round(abs(ganancia_media / perdida_media), 2) if perdida_media != 0 else None
-            resultados_por_config.append({
-                "config": nombre, "sl_pct": cfg["sl_pct"] * 100,
-                "tp1_pct": cfg["tp1_pct"] * 100, "tp2_pct": cfg["tp2_pct"] * 100,
-                "n_senales": int(len(valores)),
-                "winrate_pct": round(float(ganadoras / len(valores) * 100), 1),
-                "resultado_medio_pct": round(float(sum(valores) / len(valores)), 3),
-                "ganancia_media_pct": ganancia_media, "perdida_media_pct": perdida_media,
-                "ratio_beneficio_perdida": ratio, "n_stops": int(perdedoras_sl),
-            })
-        else:
-            resultados_por_config.append({"config": nombre, "n_senales": 0})
-
-    resultados_por_config.sort(key=lambda x: x.get("resultado_medio_pct") or -999, reverse=True)
-
-    return {
-        "simbolo": symbol, "tf": tf_label, "logica": "simple_cambio_signo",
-        "min_racha": min_racha, "n_senales_tras_filtro_4h": int(len(senales)),
-        "configs": resultados_por_config,
-    }
-
-
-# Funciones de la lógica de percentiles (mantenemos las del v2.1 sin cambios)
 def analizar_senales_tf(symbol, tf_label, interval, limit):
     raw = fetch_klines(symbol, interval, limit)
     if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
@@ -553,7 +390,6 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
     closes_validas = closes[skip + 1:]
     timestamps_validos = timestamps[skip + 1:]
     percentiles = estadisticas_pendientes(pendientes_validas)
-
     es_tf_menor = tf_label in ("5m", "15m", "1h")
     direccion_4h = {}
     if es_tf_menor:
@@ -567,7 +403,6 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
                 direccion_4h = obtener_direccion_4h(symbol, all_timestamps)
         except Exception as e:
             print(f"Error 4H: {e}")
-
     resultados_por_umbral = {}
     for umbral in UMBRALES_GIRO:
         senales = simular_senales_percentiles(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral)
@@ -582,12 +417,43 @@ def analizar_senales_tf(symbol, tf_label, interval, limit):
             resumen_filt["senales"] = evaluadas_filt[-10:]
             resultado_umbral["filtro_4h"] = resumen_filt
         resultados_por_umbral[str(umbral)] = resultado_umbral
-
     return {"tf": tf_label, "n_velas": int(len(closes)),
         "filtro_4h_aplicado": bool(es_tf_menor and direccion_4h),
         "umbrales": resultados_por_umbral}
-
-
+def analizar_senales_simple_tf(symbol, tf_label, interval, limit, min_racha=3):
+    raw = fetch_klines(symbol, interval, limit)
+    if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
+        return {"error": "datos_insuficientes"}
+    closes = np.array([float(k[4]) for k in raw])
+    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
+    macd_line, _, _ = calcular_macd(closes)
+    pendientes = calcular_pendientes(macd_line)
+    skip = MACD_SLOW + MACD_SIGNAL
+    pendientes_validas = pendientes[skip:]
+    closes_validas = closes[skip + 1:]
+    timestamps_validos = timestamps[skip + 1:]
+    senales = simular_senales_simple(pendientes_validas, closes_validas, timestamps_validos, gap_min=6, min_racha=min_racha)
+    es_tf_menor = tf_label in ("5m", "15m", "1h")
+    direccion_4h = {}
+    if es_tf_menor:
+        try:
+            all_ts = [s["timestamp"] for s in senales if s["timestamp"]]
+            if all_ts:
+                direccion_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
+        except Exception as e:
+            print(f"Error 4H: {e}")
+    evaluadas_sin = evaluar_senales(senales, closes_validas)
+    resumen_sin = resumir_evaluacion(evaluadas_sin)
+    resumen_sin["senales"] = evaluadas_sin[-10:]
+    resultado = {"tf": tf_label, "min_racha": min_racha, "n_velas": int(len(closes)), "sin_filtro": resumen_sin}
+    if es_tf_menor and direccion_4h:
+        senales_filtradas = filtrar_por_4h(senales, direccion_4h)
+        evaluadas_filt = evaluar_senales(senales_filtradas, closes_validas)
+        resumen_filt = resumir_evaluacion(evaluadas_filt)
+        resumen_filt["senales"] = evaluadas_filt[-10:]
+        resultado["filtro_4h"] = resumen_filt
+        resultado["filtro_4h_aplicado"] = True
+    return resultado
 def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
     raw = fetch_klines(symbol, interval, limit)
     if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
@@ -602,7 +468,6 @@ def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
     timestamps_validos = timestamps[skip + 1:]
     percentiles = estadisticas_pendientes(pendientes_validas)
     senales = simular_senales_percentiles(pendientes_validas, closes_validas, timestamps_validos, percentiles, umbral_fijo)
-
     es_tf_menor = tf_label in ("5m", "15m", "1h")
     if es_tf_menor:
         try:
@@ -612,7 +477,6 @@ def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
                 senales = filtrar_por_4h(senales, dir_4h)
         except Exception as e:
             print(f"Error 4H: {e}")
-
     resultados_por_config = []
     for nombre, cfg in CONFIGS_LAB.items():
         valores = []; ganadoras = 0; perdedoras_sl = 0; ganancias = []; perdidas = []
@@ -650,17 +514,70 @@ def calcular_laboratorio(symbol, tf_label, interval, limit, umbral_fijo=0.25):
         "n_senales_tras_filtro_4h": int(len(senales)),
         "configs": resultados_por_config,
     }
-
-
-# ============================================================
-# ENDPOINTS
-# ============================================================
+def calcular_laboratorio_simple(symbol, tf_label, interval, limit, min_racha=3):
+    raw = fetch_klines(symbol, interval, limit)
+    if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
+        return {"error": "datos_insuficientes"}
+    closes = np.array([float(k[4]) for k in raw])
+    timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
+    macd_line, _, _ = calcular_macd(closes)
+    pendientes = calcular_pendientes(macd_line)
+    skip = MACD_SLOW + MACD_SIGNAL
+    pendientes_validas = pendientes[skip:]
+    closes_validas = closes[skip + 1:]
+    timestamps_validos = timestamps[skip + 1:]
+    senales = simular_senales_simple(pendientes_validas, closes_validas, timestamps_validos, gap_min=6, min_racha=min_racha)
+    es_tf_menor = tf_label in ("5m", "15m", "1h")
+    if es_tf_menor:
+        try:
+            all_ts = [s["timestamp"] for s in senales if s["timestamp"]]
+            if all_ts:
+                dir_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
+                senales = filtrar_por_4h(senales, dir_4h)
+        except Exception as e:
+            print(f"Error 4H: {e}")
+    resultados_por_config = []
+    for nombre, cfg in CONFIGS_LAB.items():
+        valores = []; ganadoras = 0; perdedoras_sl = 0; ganancias = []; perdidas = []
+        for s in senales:
+            r = simular_trade_sltp(s, closes_validas, cfg)
+            if r is None:
+                continue
+            pct = r["resultado_pct"]
+            valores.append(pct)
+            if pct > 0:
+                ganadoras += 1; ganancias.append(pct)
+            else:
+                perdidas.append(pct)
+            if r["estado"] == "cerrada_sl":
+                perdedoras_sl += 1
+        if valores:
+            ganancia_media = round(float(np.mean(ganancias)), 3) if ganancias else 0
+            perdida_media = round(float(np.mean(perdidas)), 3) if perdidas else 0
+            ratio = round(abs(ganancia_media / perdida_media), 2) if perdida_media != 0 else None
+            resultados_por_config.append({
+                "config": nombre, "sl_pct": cfg["sl_pct"] * 100,
+                "tp1_pct": cfg["tp1_pct"] * 100, "tp2_pct": cfg["tp2_pct"] * 100,
+                "n_senales": int(len(valores)),
+                "winrate_pct": round(float(ganadoras / len(valores) * 100), 1),
+                "resultado_medio_pct": round(float(sum(valores) / len(valores)), 3),
+                "ganancia_media_pct": ganancia_media, "perdida_media_pct": perdida_media,
+                "ratio_beneficio_perdida": ratio, "n_stops": int(perdedoras_sl),
+            })
+        else:
+            resultados_por_config.append({"config": nombre, "n_senales": 0})
+    resultados_por_config.sort(key=lambda x: x.get("resultado_medio_pct") or -999, reverse=True)
+    return {
+        "simbolo": symbol, "tf": tf_label, "logica": "simple_cambio_signo",
+        "min_racha": min_racha, "n_senales_tras_filtro_4h": int(len(senales)),
+        "configs": resultados_por_config,
+    }
 @app.route("/")
 def home():
     return jsonify({
         "servicio": "PCELER — Acelerómetro PALMERO",
-        "version": "2.2",
-        "novedad": "Lógica SIMPLE (cambio de signo) en paralelo a la de percentiles",
+        "version": "2.3",
+        "novedad": "Monitor automático: graba señales en vivo a GitHub para auditoría",
         "endpoints_percentiles": [
             "/estado/<symbol>", "/estado/<symbol>/<tf>",
             "/calibracion/<symbol>",
@@ -669,14 +586,11 @@ def home():
         ],
         "endpoints_simple": [
             "/senales_simple/<symbol>/<tf>",
-            "/senales_simple/<symbol>/<tf>/<min_racha>",
             "/laboratorio_simple/<symbol>/<tf>",
-            "/laboratorio_simple/<symbol>/<tf>/<min_racha>",
         ],
-        "comparativa": "/comparativa/<symbol>/<tf> — los dos métodos lado a lado",
+        "comparativa": "/comparativa/<symbol>/<tf>",
+        "monitor": ["/monitor/status", "/monitor/log"],
     })
-
-
 @app.route("/estado/<symbol>")
 def estado_symbol(symbol):
     symbol = symbol.upper()
@@ -689,8 +603,6 @@ def estado_symbol(symbol):
         except Exception as e:
             resultado["timeframes"][label] = {"error": str(e)}
     return jsonify(resultado)
-
-
 @app.route("/estado/<symbol>/<tf>")
 def estado_symbol_tf(symbol, tf):
     symbol = symbol.upper(); tf = tf.lower()
@@ -704,8 +616,6 @@ def estado_symbol_tf(symbol, tf):
         return jsonify({"simbolo": symbol, "timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/calibracion/<symbol>")
 def calibracion_symbol(symbol):
     symbol = symbol.upper()
@@ -730,8 +640,6 @@ def calibracion_symbol(symbol):
         except Exception as e:
             resultado["timeframes"][label] = {"error": str(e)}
     return jsonify(resultado)
-
-
 @app.route("/senales/<symbol>/<tf>")
 def senales_symbol_tf(symbol, tf):
     symbol = symbol.upper(); tf = tf.lower()
@@ -745,8 +653,6 @@ def senales_symbol_tf(symbol, tf):
         return jsonify({"simbolo": symbol, "timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/senales_simple/<symbol>/<tf>")
 @app.route("/senales_simple/<symbol>/<tf>/<min_racha>")
 def senales_simple_endpoint(symbol, tf, min_racha=3):
@@ -765,8 +671,6 @@ def senales_simple_endpoint(symbol, tf, min_racha=3):
         return jsonify({"simbolo": symbol, "timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/laboratorio/<symbol>/<tf>")
 def laboratorio_tf_default(symbol, tf):
     symbol = symbol.upper(); tf = tf.lower()
@@ -780,8 +684,6 @@ def laboratorio_tf_default(symbol, tf):
         return jsonify({"timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/laboratorio/<symbol>/<tf>/<umbral>")
 def laboratorio_tf_umbral(symbol, tf, umbral):
     symbol = symbol.upper(); tf = tf.lower()
@@ -799,8 +701,6 @@ def laboratorio_tf_umbral(symbol, tf, umbral):
         return jsonify({"timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/laboratorio_simple/<symbol>/<tf>")
 @app.route("/laboratorio_simple/<symbol>/<tf>/<min_racha>")
 def laboratorio_simple_endpoint(symbol, tf, min_racha=3):
@@ -819,11 +719,8 @@ def laboratorio_simple_endpoint(symbol, tf, min_racha=3):
         return jsonify({"timestamp_utc": datetime.now(timezone.utc).isoformat(), **data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/comparativa/<symbol>/<tf>")
 def comparativa(symbol, tf):
-    """Compara lado a lado lógica de percentiles vs lógica simple, ambas con escala_xl"""
     symbol = symbol.upper(); tf = tf.lower()
     if symbol not in SYMBOLS:
         return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
@@ -833,14 +730,11 @@ def comparativa(symbol, tf):
     try:
         lab_perc = calcular_laboratorio(symbol, tf, cfg["interval"], cfg["limit"], umbral_fijo=0.25)
         lab_simple = calcular_laboratorio_simple(symbol, tf, cfg["interval"], cfg["limit"], min_racha=3)
-
-        # Extraer solo escala_xl de cada uno para comparar directo
         def get_xl(lab):
             for c in lab.get("configs", []):
                 if c.get("config") == "escala_xl":
                     return c
             return None
-
         return jsonify({
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "simbolo": symbol, "tf": tf,
@@ -859,8 +753,6 @@ def comparativa(symbol, tf):
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 @app.route("/t/<bust>")
 def todo_nocache(bust):
     resultado = {"timestamp_utc": datetime.now(timezone.utc).isoformat()}
@@ -873,7 +765,194 @@ def todo_nocache(bust):
                 resultado[symbol][label] = {"error": str(e)}
     return jsonify(resultado)
 
+# ─── MONITOR: funciones de grabación automática ───
+
+def gh_read_log():
+    """Lee pceler_signals_log.json desde GitHub. Retorna (data_list, sha)."""
+    if not GH_TOKEN:
+        return [], None
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{GH_REPO}/contents/{GH_LOG_FILE}",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "User-Agent": "pceler-monitor",
+                     "Accept": "application/vnd.github+json"},
+            timeout=15
+        )
+        if resp.status_code == 404:
+            return [], None
+        resp.raise_for_status()
+        j = resp.json()
+        decoded = base64.b64decode(j["content"]).decode("utf-8")
+        data = json.loads(decoded)
+        return data, j["sha"]
+    except Exception as e:
+        print(f"[MONITOR] Error leyendo GitHub: {e}")
+        return [], None
+
+
+def gh_write_log(data, sha):
+    """Escribe pceler_signals_log.json a GitHub. Re-lee SHA justo antes."""
+    if not GH_TOKEN:
+        return
+    try:
+        # Re-leer SHA inmediatamente antes de escribir (evitar 409)
+        resp_sha = requests.get(
+            f"https://api.github.com/repos/{GH_REPO}/contents/{GH_LOG_FILE}",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "User-Agent": "pceler-monitor",
+                     "Accept": "application/vnd.github+json"},
+            timeout=15
+        )
+        if resp_sha.status_code == 200:
+            sha = resp_sha.json()["sha"]
+
+        content_b64 = base64.b64encode(json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")).decode("utf-8")
+        body = {
+            "message": f"PCELER signal log {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}",
+            "content": content_b64,
+        }
+        if sha:
+            body["sha"] = sha
+
+        resp = requests.put(
+            f"https://api.github.com/repos/{GH_REPO}/contents/{GH_LOG_FILE}",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "User-Agent": "pceler-monitor",
+                     "Accept": "application/vnd.github+json",
+                     "Content-Type": "application/json"},
+            json=body,
+            timeout=15
+        )
+        if resp.ok:
+            print(f"[MONITOR] Log guardado en GitHub ({len(data)} señales)")
+        else:
+            print(f"[MONITOR] Error escribiendo GitHub: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[MONITOR] Error escribiendo GitHub: {e}")
+
+
+def detectar_senales_monitor(symbol):
+    """Detecta señales actuales para un símbolo en 15m con filtro 4H."""
+    try:
+        cfg = TIMEFRAMES[MONITOR_TF]
+        raw = fetch_klines(symbol, cfg["interval"], cfg["limit"])
+        if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
+            return []
+        closes = np.array([float(k[4]) for k in raw])
+        timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
+        macd_line, _, _ = calcular_macd(closes)
+        pendientes = calcular_pendientes(macd_line)
+        skip = MACD_SLOW + MACD_SIGNAL
+        pendientes_validas = pendientes[skip:]
+        closes_validas = closes[skip + 1:]
+        timestamps_validos = timestamps[skip + 1:]
+        percentiles = estadisticas_pendientes(pendientes_validas)
+        senales = simular_senales_percentiles(
+            pendientes_validas, closes_validas, timestamps_validos, percentiles, MONITOR_UMBRAL
+        )
+        # Filtro 4H
+        all_ts = [s["timestamp"] for s in senales if s.get("timestamp")]
+        if all_ts:
+            dir_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
+            senales = filtrar_por_4h(senales, dir_4h)
+        return senales
+    except Exception as e:
+        print(f"[MONITOR] Error detectando señales {symbol}: {e}")
+        return []
+
+
+def monitor_cycle():
+    """Un ciclo de monitorización: detectar señales nuevas y grabarlas."""
+    global _logged_timestamps, _monitor_initialized
+
+    # Primera vez: cargar log existente de GitHub
+    if not _monitor_initialized:
+        existing_log, _ = gh_read_log()
+        for entry in existing_log:
+            ts = entry.get("timestamp")
+            if ts:
+                _logged_timestamps.add(ts)
+        print(f"[MONITOR] Inicializado con {len(_logged_timestamps)} señales previas")
+        _monitor_initialized = True
+
+    nuevas = []
+    for symbol in SYMBOLS:
+        senales = detectar_senales_monitor(symbol)
+        for s in senales:
+            ts = s.get("timestamp")
+            if ts and ts not in _logged_timestamps:
+                entry = {
+                    "timestamp": ts,
+                    "symbol": symbol,
+                    "tf": MONITOR_TF,
+                    "tipo": s["tipo"],
+                    "precio": s["precio"],
+                    "umbral": MONITOR_UMBRAL,
+                    "direccion_4h": s.get("direccion_4h", "desconocida"),
+                    "logged_at": datetime.now(timezone.utc).isoformat(),
+                }
+                nuevas.append(entry)
+                _logged_timestamps.add(ts)
+
+    if nuevas:
+        # Leer log actual, añadir nuevas, escribir
+        log_actual, sha = gh_read_log()
+        log_actual.extend(nuevas)
+        gh_write_log(log_actual, sha)
+        print(f"[MONITOR] {len(nuevas)} señales nuevas grabadas")
+    else:
+        print(f"[MONITOR] Sin señales nuevas ({datetime.now(timezone.utc).strftime('%H:%M')} UTC)")
+
+
+def monitor_loop():
+    """Bucle de fondo que corre indefinidamente."""
+    # Esperar 30s al arrancar para que Flask esté listo
+    time.sleep(30)
+    print(f"[MONITOR] Arrancando monitor de señales (intervalo: {MONITOR_INTERVAL}s)")
+    while True:
+        try:
+            monitor_cycle()
+        except Exception as e:
+            print(f"[MONITOR] Error en ciclo: {e}")
+        time.sleep(MONITOR_INTERVAL)
+
+
+@app.route("/monitor/status")
+def monitor_status():
+    """Endpoint para verificar el estado del monitor."""
+    return jsonify({
+        "monitor_activo": bool(GH_TOKEN),
+        "señales_registradas": len(_logged_timestamps),
+        "intervalo_segundos": MONITOR_INTERVAL,
+        "tf_monitoreado": MONITOR_TF,
+        "umbral": MONITOR_UMBRAL,
+        "repo": GH_REPO,
+        "archivo": GH_LOG_FILE,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/monitor/log")
+def monitor_log():
+    """Endpoint para ver el log de señales grabadas."""
+    log_data, _ = gh_read_log()
+    return jsonify({
+        "n_señales": len(log_data),
+        "señales": log_data,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    })
+
+# ─── FIN MONITOR ───
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    # Arrancar monitor de señales en hilo de fondo
+    if GH_TOKEN:
+        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        monitor_thread.start()
+        print(f"[MONITOR] Hilo de monitor arrancado")
+    else:
+        print("[MONITOR] GITHUB_TOKEN no configurado — monitor desactivado")
+
     app.run(host="0.0.0.0", port=port)
