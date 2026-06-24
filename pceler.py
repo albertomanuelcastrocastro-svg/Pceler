@@ -945,14 +945,14 @@ def monitor_log():
 
 # ─── FIN MONITOR ───
 
+# Arrancar monitor al importar el módulo (funciona con gunicorn Y con python directo)
+if GH_TOKEN:
+    _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    _monitor_thread.start()
+    print(f"[MONITOR] Hilo de monitor arrancado")
+else:
+    print("[MONITOR] GITHUB_TOKEN no configurado — monitor desactivado")
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    # Arrancar monitor de señales en hilo de fondo
-    if GH_TOKEN:
-        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-        monitor_thread.start()
-        print(f"[MONITOR] Hilo de monitor arrancado")
-    else:
-        print("[MONITOR] GITHUB_TOKEN no configurado — monitor desactivado")
-
     app.run(host="0.0.0.0", port=port)
