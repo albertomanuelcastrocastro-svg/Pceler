@@ -870,8 +870,8 @@ def gh_write_log(data, sha):
 
 
 def detectar_senales_monitor(symbol):
-    """Detecta señales con lógica relativa (% del precio), SIN filtro 4H.
-    Coincide exactamente con Pine PCELER v2 (filtro desactivado)."""
+    """Detecta señales con lógica relativa (% del precio) + filtro 4H histograma.
+    Coincide con Pine PCELER v2 (filtro activado)."""
     try:
         raw = fetch_klines(symbol, "15m", 500)
         if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
@@ -881,6 +881,7 @@ def detectar_senales_monitor(symbol):
         macd_line, signal_line, _ = calcular_macd(closes)
         pendientes = calcular_pendientes(macd_line)
         histograma = macd_line - signal_line
+        dir_4h_map = get_4h_hist_direction(symbol, timestamps_ms)
         senales = []
         skip = MACD_SLOW + MACD_SIGNAL
         ultima_senal_idx = -7
@@ -889,6 +890,10 @@ def detectar_senales_monitor(symbol):
                 continue
             precio_idx = i + 1
             if precio_idx >= len(closes):
+                continue
+            ts = timestamps_ms[precio_idx]
+            dir_4h = dir_4h_map.get(ts, "lateral")
+            if dir_4h == "lateral":
                 continue
             precio = float(closes[precio_idx])
             if precio <= 0:
@@ -901,24 +906,27 @@ def detectar_senales_monitor(symbol):
             dist_pct = abs(hist_val) / precio * 100
             if dist_pct < MONITOR_DIST_PCT:
                 continue
-            ts = timestamps_ms[precio_idx]
             ts_iso = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
-            if macd_val < 0 and macd_pct >= MONITOR_ELONG_PCT:
+            if dir_4h == "alcista" and macd_val < 0 and macd_pct >= MONITOR_ELONG_PCT:
                 if pend_actual > 0 and pend_anterior <= 0:
                     senales.append({
                         "tipo": "LONG", "precio": round(precio, 6),
                         "timestamp": ts_iso,
+                        "macd_15m": round(macd_val, 8),
                         "macd_pct": round(macd_pct, 4),
                         "dist_pct": round(dist_pct, 4),
+                        "direccion_4h": dir_4h,
                     })
                     ultima_senal_idx = i
-            elif macd_val > 0 and macd_pct >= MONITOR_ELONG_PCT:
+            elif dir_4h == "bajista" and macd_val > 0 and macd_pct >= MONITOR_ELONG_PCT:
                 if pend_actual < 0 and pend_anterior >= 0:
                     senales.append({
                         "tipo": "SHORT", "precio": round(precio, 6),
                         "timestamp": ts_iso,
+                        "macd_15m": round(macd_val, 8),
                         "macd_pct": round(macd_pct, 4),
                         "dist_pct": round(dist_pct, 4),
+                        "direccion_4h": dir_4h,
                     })
                     ultima_senal_idx = i
         return senales
@@ -997,7 +1005,7 @@ def monitor_status():
         "logica": "relativa_al_precio",
         "elong_pct": MONITOR_ELONG_PCT,
         "dist_pct": MONITOR_DIST_PCT,
-        "filtro_4h": "desactivado",
+        "filtro_4h": "histograma",
         "repo": GH_REPO,
         "archivo": GH_LOG_FILE,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
