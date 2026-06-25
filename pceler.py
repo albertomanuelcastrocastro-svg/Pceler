@@ -2237,6 +2237,30 @@ _paper_thread.start()
 
 # ─── FIN PAPER TRADING ───
 
+# Test de conectividad a Binance
+@app.route("/paper/test_binance")
+def test_binance():
+    resultados = {}
+    # Test data-api (publica, ya funciona)
+    try:
+        r = req_lib.get("https://data-api.binance.vision/api/v3/ticker/price?symbol=XRPUSDT", timeout=8)
+        resultados["data-api.binance.vision"] = {"ok": True, "precio": r.json().get("price")}
+    except Exception as e:
+        resultados["data-api.binance.vision"] = {"ok": False, "error": str(e)}
+    # Test api.binance.com (necesaria para operar)
+    try:
+        r = req_lib.get("https://api.binance.com/api/v3/ping", timeout=8)
+        resultados["api.binance.com"] = {"ok": True, "respuesta": r.json()}
+    except Exception as e:
+        resultados["api.binance.com"] = {"ok": False, "error": str(e)}
+    # Test testnet
+    try:
+        r = req_lib.get("https://testnet.binancefuture.com/fapi/v1/ping", timeout=8)
+        resultados["testnet.binancefuture.com"] = {"ok": True, "respuesta": r.json()}
+    except Exception as e:
+        resultados["testnet.binancefuture.com"] = {"ok": False, "error": str(e)}
+    return jsonify(resultados)
+
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
 # Lógica: MACD llega a un extremo (elongado) y empieza a caer/subir desde ahí.
 # SHORT: MACD ESTUVO positivo y elongado, ahora pendiente gira negativa → acompaña la caída
