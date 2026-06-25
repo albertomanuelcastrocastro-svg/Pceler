@@ -1180,7 +1180,7 @@ def simular_con_config(senales, closes, cfg_name, cfg):
             "timestamp": s["timestamp"],
             "tipo": s["tipo"],
             "precio": s["precio"],
-            "macd_15m": s["macd_15m"],
+            "macd_15m": s.get("macd_15m", 0),
             "resultado_pct": round(resultado_parcial * 100, 3),
             "mejor_pct": round(mejor_pct * 100, 3),
             "ganadora": bool(resultado_parcial > 0),
