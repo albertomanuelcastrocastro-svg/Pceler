@@ -970,7 +970,7 @@ def get_4h_direction_for_15m(symbol, timestamps_15m_ms):
     ts_open_4h = [int(k[0]) for k in raw_4h]
     ts_close_4h = [int(k[6]) for k in raw_4h]
 
-    macd_4h, _ = calcular_macd(closes_4h)
+    macd_4h, _, _ = calcular_macd(closes_4h)
     pend_4h = np.diff(macd_4h)
 
     dir_map = {}
@@ -1133,7 +1133,7 @@ def laboratorio_elongacion(symbol):
         closes = np.array([float(k[4]) for k in raw_15m])
         timestamps_ms = [int(k[0]) for k in raw_15m]
 
-        macd_line, _ = calcular_macd(closes)
+        macd_line, _, _ = calcular_macd(closes)
         pendientes = calcular_pendientes(macd_line)
 
         dir_4h_map = get_4h_direction_for_15m(symbol, timestamps_ms)
