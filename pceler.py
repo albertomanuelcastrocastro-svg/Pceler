@@ -1766,13 +1766,13 @@ def laboratorio_relativo_sin4h(symbol):
                     if macd_val < 0 and macd_pct >= umbral_e:
                         if pend_actual > 0 and pend_anterior <= 0:
                             senales.append({"tipo": "LONG", "precio": round(precio, 6),
-                                "timestamp": ts_iso, "macd_pct": round(macd_pct, 4),
+                                "timestamp": ts_iso, "macd_pct": round(macd_pct, 4), "macd_15m": round(macd_val, 8),
                                 "vela_idx": int(precio_idx)})
                             ultima_idx = i
                     elif macd_val > 0 and macd_pct >= umbral_e:
                         if pend_actual < 0 and pend_anterior >= 0:
                             senales.append({"tipo": "SHORT", "precio": round(precio, 6),
-                                "timestamp": ts_iso, "macd_pct": round(macd_pct, 4),
+                                "timestamp": ts_iso, "macd_pct": round(macd_pct, 4), "macd_15m": round(macd_val, 8),
                                 "vela_idx": int(precio_idx)})
                             ultima_idx = i
                 results = simular_con_config(senales, closes, "escala_xl", CONFIGS_ELONG["escala_xl"])
