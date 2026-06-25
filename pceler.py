@@ -1985,6 +1985,258 @@ def laboratorio_palmero15(symbol):
 
 # ─── FIN LABORATORIO PALMERO 15 ───
 
+# ─── PAPER TRADING BOT ───
+import requests as req_lib
+
+PAPER_SL    = 0.03
+PAPER_TP1   = 0.015
+PAPER_TP1_PESO = 0.40
+PAPER_TP2   = 0.025
+PAPER_TP2_PESO = 0.30
+PAPER_TRAIL = 0.015
+PAPER_USDT  = 100.0
+PAPER_POLL  = 30
+
+_paper_active = {}
+_paper_trades = []
+_paper_lock = threading.Lock()
+
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "5448802464")
+
+
+def paper_precio(symbol):
+    try:
+        r = req_lib.get(f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbol}", timeout=8)
+        return float(r.json()["price"])
+    except:
+        return None
+
+
+def paper_telegram(msg):
+    if not TG_TOKEN:
+        return
+    try:
+        req_lib.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    except:
+        pass
+
+
+def paper_abrir(symbol, tipo, precio_senal):
+    with _paper_lock:
+        if symbol in _paper_active:
+            return {"error": f"ya hay posicion en {symbol}"}
+    precio = paper_precio(symbol)
+    if not precio:
+        return {"error": f"no se pudo obtener precio de {symbol}"}
+    if tipo == "LONG":
+        sl  = round(precio * (1 - PAPER_SL), 6)
+        tp1 = round(precio * (1 + PAPER_TP1), 6)
+        tp2 = round(precio * (1 + PAPER_TP2), 6)
+    else:
+        sl  = round(precio * (1 + PAPER_SL), 6)
+        tp1 = round(precio * (1 - PAPER_TP1), 6)
+        tp2 = round(precio * (1 - PAPER_TP2), 6)
+    pos = {
+        "symbol": symbol, "tipo": tipo,
+        "precio_entrada": precio, "precio_senal": precio_senal,
+        "sl": sl, "tp1": tp1, "tp2": tp2,
+        "tp1_tocado": False, "tp2_tocado": False,
+        "breakeven": False, "trailing_activo": False,
+        "trailing_stop": None, "mejor_precio": precio,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "usdt": PAPER_USDT,
+    }
+    with _paper_lock:
+        _paper_active[symbol] = pos
+    emoji = "\U0001f7e2" if tipo == "LONG" else "\U0001f534"
+    paper_telegram(f"{emoji} <b>PAPER TRADE ABIERTO</b>\n"
+        f"{symbol} {tipo}\nEntrada: {precio}\nSL: {sl} (-3%)\n"
+        f"TP1: {tp1} (+1.5%) 40%\nTP2: {tp2} (+2.5%) 30%\nTrailing: 1.5%")
+    return pos
+
+
+def paper_cerrar(symbol, razon, precio_cierre, resultado_pct):
+    with _paper_lock:
+        pos = _paper_active.pop(symbol, None)
+    if not pos:
+        return
+    pos["resultado_pct"] = round(resultado_pct * 100, 3)
+    pos["precio_cierre"] = precio_cierre
+    pos["razon"] = razon
+    pos["ganadora"] = resultado_pct > 0
+    pos["usdt_resultado"] = round(PAPER_USDT * resultado_pct, 2)
+    _paper_trades.append(pos)
+    emoji = "\u2705" if pos["ganadora"] else "\u274c"
+    paper_telegram(f"{emoji} <b>PAPER CERRADO</b> {razon}\n"
+        f"{symbol} {pos['tipo']}\nEntrada: {pos['precio_entrada']} Cierre: {precio_cierre}\n"
+        f"Resultado: {pos['resultado_pct']}%\nP&L: ${pos['usdt_resultado']}")
+
+
+def paper_gestionar(symbol):
+    with _paper_lock:
+        pos = dict(_paper_active.get(symbol, {}))
+    if not pos:
+        return
+    precio = paper_precio(symbol)
+    if not precio:
+        return
+    tipo = pos["tipo"]
+    entrada = pos["precio_entrada"]
+    cambio = (precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada
+    with _paper_lock:
+        if symbol in _paper_active:
+            if tipo == "LONG":
+                _paper_active[symbol]["mejor_precio"] = max(pos["mejor_precio"], precio)
+            else:
+                _paper_active[symbol]["mejor_precio"] = min(pos["mejor_precio"], precio)
+    if not pos["tp1_tocado"] and cambio <= -PAPER_SL:
+        paper_cerrar(symbol, "STOP LOSS", precio, -PAPER_SL)
+        return
+    if pos["breakeven"] and cambio <= 0:
+        paper_cerrar(symbol, "BREAKEVEN", precio, 0)
+        return
+    if pos["trailing_activo"] and pos["trailing_stop"]:
+        if tipo == "LONG" and precio <= pos["trailing_stop"]:
+            t_pct = (pos["trailing_stop"] - entrada) / entrada
+            paper_cerrar(symbol, "TRAILING \U0001f40e", precio, t_pct)
+            return
+        elif tipo == "SHORT" and precio >= pos["trailing_stop"]:
+            t_pct = (entrada - pos["trailing_stop"]) / entrada
+            paper_cerrar(symbol, "TRAILING \U0001f40e", precio, t_pct)
+            return
+    if not pos["tp1_tocado"] and cambio >= PAPER_TP1:
+        with _paper_lock:
+            if symbol in _paper_active:
+                _paper_active[symbol]["tp1_tocado"] = True
+                _paper_active[symbol]["breakeven"] = True
+        paper_telegram(f"\U0001f3af <b>PAPER TP1</b> {symbol} {tipo}\nPrecio: {precio} (+1.5%)\n40% cerrado. Stop breakeven")
+    if pos["tp1_tocado"] and not pos["tp2_tocado"] and cambio >= PAPER_TP2:
+        with _paper_lock:
+            if symbol in _paper_active:
+                _paper_active[symbol]["tp2_tocado"] = True
+                _paper_active[symbol]["trailing_activo"] = True
+                if tipo == "LONG":
+                    _paper_active[symbol]["trailing_stop"] = round(precio * (1 - PAPER_TRAIL), 6)
+                else:
+                    _paper_active[symbol]["trailing_stop"] = round(precio * (1 + PAPER_TRAIL), 6)
+        paper_telegram(f"\U0001f3af <b>PAPER TP2</b> {symbol} {tipo}\nPrecio: {precio} (+2.5%)\n30% cerrado. \U0001f40e Trailing 1.5%")
+    if pos["trailing_activo"]:
+        with _paper_lock:
+            if symbol in _paper_active:
+                if tipo == "LONG":
+                    nuevo = round(precio * (1 - PAPER_TRAIL), 6)
+                    if nuevo > (_paper_active[symbol]["trailing_stop"] or 0):
+                        _paper_active[symbol]["trailing_stop"] = nuevo
+                else:
+                    nuevo = round(precio * (1 + PAPER_TRAIL), 6)
+                    ts = _paper_active[symbol]["trailing_stop"]
+                    if ts is None or nuevo < ts:
+                        _paper_active[symbol]["trailing_stop"] = nuevo
+
+
+def paper_monitor_loop():
+    time.sleep(30)
+    print("[PAPER] Monitor arrancado")
+    while True:
+        try:
+            for s in list(_paper_active.keys()):
+                paper_gestionar(s)
+        except Exception as e:
+            print(f"[PAPER] Error: {e}")
+        time.sleep(PAPER_POLL)
+
+
+@app.route("/paper")
+def paper_home():
+    return jsonify({
+        "servicio": "PALMERO Paper Trading (dentro de PCELER)",
+        "posiciones_activas": len(_paper_active),
+        "trades_completados": len(_paper_trades),
+        "config": {"sl": "-3%", "tp1": "+1.5% (40%)", "tp2": "+2.5% (30%)", "trailing": "1.5%", "usdt": PAPER_USDT},
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/paper/webhook", methods=["POST"])
+def paper_webhook():
+    try:
+        body = request.get_data(as_text=True).strip()
+        print(f"[PAPER] Webhook: {body}")
+        partes = body.split()
+        symbol = partes[0].upper() if partes else ""
+        tipo = None
+        precio = 0.0
+        for p in partes:
+            if "LONG" in p.upper(): tipo = "LONG"
+            elif "SHORT" in p.upper(): tipo = "SHORT"
+            try: precio = float(p)
+            except: pass
+        if not tipo or not symbol:
+            return jsonify({"error": "formato invalido"}), 400
+        resultado = paper_abrir(symbol, tipo, precio)
+        return jsonify({"ok": True, "trade": resultado})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/paper/posiciones")
+def paper_posiciones():
+    resultado = {}
+    for s, pos in _paper_active.items():
+        precio = paper_precio(s) or 0
+        tipo = pos["tipo"]
+        entrada = pos["precio_entrada"]
+        cambio = ((precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada) if precio else 0
+        resultado[s] = {
+            "tipo": tipo, "entrada": entrada, "precio_actual": precio,
+            "pnl_pct": round(cambio * 100, 3),
+            "sl": pos["sl"], "tp1": pos["tp1"], "tp1_tocado": pos["tp1_tocado"],
+            "tp2": pos["tp2"], "tp2_tocado": pos["tp2_tocado"],
+            "trailing_stop": pos["trailing_stop"], "trailing_activo": pos["trailing_activo"],
+            "timestamp": pos["timestamp"],
+        }
+    return jsonify({"posiciones": resultado, "timestamp_utc": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/paper/historial")
+def paper_historial():
+    n = len(_paper_trades)
+    g = sum(1 for t in _paper_trades if t.get("ganadora"))
+    total_pct = sum(t.get("resultado_pct", 0) for t in _paper_trades)
+    total_usdt = sum(t.get("usdt_resultado", 0) for t in _paper_trades)
+    resumen = [{"symbol": t["symbol"], "tipo": t["tipo"], "entrada": t["precio_entrada"],
+        "cierre": t.get("precio_cierre"), "razon": t.get("razon"),
+        "resultado_pct": t.get("resultado_pct", 0), "usdt": t.get("usdt_resultado", 0),
+        "ganadora": t.get("ganadora"), "timestamp": t["timestamp"]} for t in _paper_trades]
+    return jsonify({
+        "n_trades": n, "ganadoras": g,
+        "winrate": round(g / n * 100, 1) if n else 0,
+        "total_pct": round(total_pct, 2), "total_usdt": round(total_usdt, 2),
+        "media_pct": round(total_pct / n, 3) if n else 0,
+        "trades": resumen, "timestamp_utc": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/paper/cerrar/<symbol>")
+def paper_cerrar_manual(symbol):
+    symbol = symbol.upper()
+    if symbol not in _paper_active:
+        return jsonify({"error": f"no hay posicion en {symbol}"}), 404
+    precio = paper_precio(symbol) or _paper_active[symbol]["precio_entrada"]
+    tipo = _paper_active[symbol]["tipo"]
+    entrada = _paper_active[symbol]["precio_entrada"]
+    cambio = (precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada
+    paper_cerrar(symbol, "MANUAL", precio, cambio)
+    return jsonify({"ok": True, "cerrado": symbol})
+
+
+# Arrancar paper monitor
+_paper_thread = threading.Thread(target=paper_monitor_loop, daemon=True)
+_paper_thread.start()
+
+# ─── FIN PAPER TRADING ───
+
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
 # Lógica: MACD llega a un extremo (elongado) y empieza a caer/subir desde ahí.
 # SHORT: MACD ESTUVO positivo y elongado, ahora pendiente gira negativa → acompaña la caída
