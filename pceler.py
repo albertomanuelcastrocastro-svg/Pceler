@@ -64,7 +64,9 @@ GH_REPO = os.environ.get("PCELER_LOG_REPO", "albertomanuelcastrocastro-svg/palme
 GH_LOG_FILE = "pceler_signals_log.json"
 MONITOR_INTERVAL = 960  # 16 minutos (> 1 vela de 15m)
 MONITOR_TF = "15m"
-MONITOR_UMBRAL = 0.25
+MONITOR_UMBRAL = 0.25  # legacy, se mantiene por compatibilidad
+MONITOR_ELONG_PCT = 0.25  # % del precio
+MONITOR_DIST_PCT = 0.15   # % del precio
 _logged_timestamps = set()  # timestamps ya registrados (en memoria)
 _monitor_initialized = False
 
@@ -868,29 +870,63 @@ def gh_write_log(data, sha):
 
 
 def detectar_senales_monitor(symbol):
-    """Detecta señales actuales para un símbolo en 15m con filtro 4H."""
+    """Detecta señales con lógica relativa (% del precio) + filtro 4H histograma.
+    Coincide exactamente con Pine PCELER v2."""
     try:
-        cfg = TIMEFRAMES[MONITOR_TF]
-        raw = fetch_klines(symbol, cfg["interval"], cfg["limit"])
+        raw = fetch_klines(symbol, "15m", 500)
         if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
             return []
         closes = np.array([float(k[4]) for k in raw])
-        timestamps = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc).isoformat() for k in raw]
-        macd_line, _, _ = calcular_macd(closes)
+        timestamps_ms = [int(k[0]) for k in raw]
+        macd_line, signal_line, _ = calcular_macd(closes)
         pendientes = calcular_pendientes(macd_line)
+        histograma = macd_line - signal_line
+        dir_4h_map = get_4h_hist_direction(symbol, timestamps_ms)
+        senales = []
         skip = MACD_SLOW + MACD_SIGNAL
-        pendientes_validas = pendientes[skip:]
-        closes_validas = closes[skip + 1:]
-        timestamps_validos = timestamps[skip + 1:]
-        percentiles = estadisticas_pendientes(pendientes_validas)
-        senales = simular_senales_percentiles(
-            pendientes_validas, closes_validas, timestamps_validos, percentiles, MONITOR_UMBRAL
-        )
-        # Filtro 4H
-        all_ts = [s["timestamp"] for s in senales if s.get("timestamp")]
-        if all_ts:
-            dir_4h = obtener_direccion_4h(symbol, list(set(all_ts)))
-            senales = filtrar_por_4h(senales, dir_4h)
+        ultima_senal_idx = -7
+        for i in range(skip + 1, len(pendientes)):
+            if (i - ultima_senal_idx) < 6:
+                continue
+            precio_idx = i + 1
+            if precio_idx >= len(closes):
+                continue
+            ts = timestamps_ms[precio_idx]
+            dir_4h = dir_4h_map.get(ts, "lateral")
+            if dir_4h == "lateral":
+                continue
+            precio = float(closes[precio_idx])
+            if precio <= 0:
+                continue
+            pend_actual = float(pendientes[i])
+            pend_anterior = float(pendientes[i - 1])
+            macd_val = float(macd_line[i])
+            hist_val = float(histograma[i])
+            macd_pct = abs(macd_val) / precio * 100
+            dist_pct = abs(hist_val) / precio * 100
+            if dist_pct < MONITOR_DIST_PCT:
+                continue
+            ts_iso = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+            if dir_4h == "alcista" and macd_val < 0 and macd_pct >= MONITOR_ELONG_PCT:
+                if pend_actual > 0 and pend_anterior <= 0:
+                    senales.append({
+                        "tipo": "LONG", "precio": round(precio, 6),
+                        "timestamp": ts_iso,
+                        "macd_pct": round(macd_pct, 4),
+                        "dist_pct": round(dist_pct, 4),
+                        "direccion_4h": dir_4h,
+                    })
+                    ultima_senal_idx = i
+            elif dir_4h == "bajista" and macd_val > 0 and macd_pct >= MONITOR_ELONG_PCT:
+                if pend_actual < 0 and pend_anterior >= 0:
+                    senales.append({
+                        "tipo": "SHORT", "precio": round(precio, 6),
+                        "timestamp": ts_iso,
+                        "macd_pct": round(macd_pct, 4),
+                        "dist_pct": round(dist_pct, 4),
+                        "direccion_4h": dir_4h,
+                    })
+                    ultima_senal_idx = i
         return senales
     except Exception as e:
         print(f"[MONITOR] Error detectando señales {symbol}: {e}")
@@ -923,7 +959,10 @@ def monitor_cycle():
                     "tf": MONITOR_TF,
                     "tipo": s["tipo"],
                     "precio": s["precio"],
-                    "umbral": MONITOR_UMBRAL,
+                    "macd_pct": s.get("macd_pct", 0),
+                    "dist_pct": s.get("dist_pct", 0),
+                    "elong_umbral": MONITOR_ELONG_PCT,
+                    "dist_umbral": MONITOR_DIST_PCT,
                     "direccion_4h": s.get("direccion_4h", "desconocida"),
                     "logged_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -961,7 +1000,10 @@ def monitor_status():
         "señales_registradas": len(_logged_timestamps),
         "intervalo_segundos": MONITOR_INTERVAL,
         "tf_monitoreado": MONITOR_TF,
-        "umbral": MONITOR_UMBRAL,
+        "logica": "relativa_al_precio",
+        "elong_pct": MONITOR_ELONG_PCT,
+        "dist_pct": MONITOR_DIST_PCT,
+        "filtro_4h": "histograma",
         "repo": GH_REPO,
         "archivo": GH_LOG_FILE,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
