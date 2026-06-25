@@ -1686,6 +1686,138 @@ def laboratorio_relativo(symbol):
 
 # ─── FIN LABORATORIO RELATIVO ───
 
+# ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
+# Lógica: MACD llega a un extremo (elongado) y empieza a caer/subir desde ahí.
+# SHORT: MACD ESTUVO positivo y elongado, ahora pendiente gira negativa → acompaña la caída
+# LONG: MACD ESTUVO negativo y elongado, ahora pendiente gira positiva → acompaña la subida
+UMBRALES_CONT_ELONG = [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
+UMBRALES_CONT_DIST = [0.0, 0.05, 0.1, 0.15, 0.2]
+
+
+def detectar_senales_continuacion(closes, macd_line, signal_line, pendientes, timestamps_ms, umbral_elong_pct, umbral_dist_pct, gap_min=6):
+    """Señales de continuación: entra A FAVOR del movimiento del MACD desde extremos."""
+    senales = []
+    skip = MACD_SLOW + MACD_SIGNAL
+    ultima_senal_idx = -gap_min - 1
+    histograma = macd_line - signal_line
+    max_macd_pct = 0.0
+    min_macd_pct = 0.0
+    for i in range(skip + 1, len(pendientes)):
+        precio_idx = i + 1
+        if precio_idx >= len(closes):
+            continue
+        precio = float(closes[precio_idx])
+        if precio <= 0:
+            continue
+        macd_val = float(macd_line[i])
+        macd_pct_actual = macd_val / precio * 100
+        if macd_pct_actual > 0:
+            max_macd_pct = max(max_macd_pct, macd_pct_actual)
+        elif macd_pct_actual < 0:
+            min_macd_pct = min(min_macd_pct, macd_pct_actual)
+        if (i - ultima_senal_idx) < gap_min:
+            continue
+        pend_actual = float(pendientes[i])
+        pend_anterior = float(pendientes[i - 1])
+        hist_val = float(histograma[i])
+        dist_pct = abs(hist_val) / precio * 100
+        if dist_pct < umbral_dist_pct:
+            continue
+        ts = timestamps_ms[precio_idx]
+        # SHORT: MACD estuvo positivo y elongado, pendiente gira negativa
+        if pend_actual < 0 and pend_anterior >= 0 and max_macd_pct >= umbral_elong_pct:
+            senales.append({
+                "tipo": "SHORT",
+                "precio": round(precio, 6),
+                "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                "macd_15m": round(macd_val, 8),
+                "macd_pct": round(macd_pct_actual, 4),
+                "max_alcanzado_pct": round(max_macd_pct, 4),
+                "dist_pct": round(dist_pct, 4),
+                "vela_idx": int(precio_idx),
+            })
+            ultima_senal_idx = i
+            max_macd_pct = 0.0
+        # LONG: MACD estuvo negativo y elongado, pendiente gira positiva
+        elif pend_actual > 0 and pend_anterior <= 0 and abs(min_macd_pct) >= umbral_elong_pct:
+            senales.append({
+                "tipo": "LONG",
+                "precio": round(precio, 6),
+                "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                "macd_15m": round(macd_val, 8),
+                "macd_pct": round(macd_pct_actual, 4),
+                "min_alcanzado_pct": round(min_macd_pct, 4),
+                "dist_pct": round(dist_pct, 4),
+                "vela_idx": int(precio_idx),
+            })
+            ultima_senal_idx = i
+            min_macd_pct = 0.0
+    return senales
+
+
+@app.route("/laboratorio_continuacion/<symbol>")
+def laboratorio_continuacion(symbol):
+    """Testea lógica de continuación: entrar A FAVOR del movimiento MACD."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    try:
+        raw_15m = fetch_klines_extended(symbol, "15m", 3000)
+        closes = np.array([float(k[4]) for k in raw_15m])
+        timestamps_ms = [int(k[0]) for k in raw_15m]
+        macd_line, signal_line, _ = calcular_macd(closes)
+        pendientes = calcular_pendientes(macd_line)
+        resultados = []
+        mejor_combo = None
+        mejor_resultado = -999
+        for umbral_e in UMBRALES_CONT_ELONG:
+            for umbral_d in UMBRALES_CONT_DIST:
+                senales = detectar_senales_continuacion(
+                    closes, macd_line, signal_line, pendientes, timestamps_ms,
+                    umbral_e, umbral_d
+                )
+                results = simular_con_config(senales, closes, "escala_xl", CONFIGS_ELONG["escala_xl"])
+                n = len(results)
+                if n == 0:
+                    resultados.append({
+                        "elong_pct": umbral_e, "dist_pct": umbral_d,
+                        "n_senales": 0, "xl_winrate": 0, "xl_media": 0, "xl_total": 0,
+                    })
+                    continue
+                ganadoras = sum(1 for r in results if r["ganadora"])
+                winrate = round(ganadoras / n * 100, 1)
+                media = round(sum(r["resultado_pct"] for r in results) / n, 3)
+                total = round(sum(r["resultado_pct"] for r in results), 3)
+                resultados.append({
+                    "elong_pct": umbral_e, "dist_pct": umbral_d,
+                    "n_senales": n, "xl_winrate": winrate, "xl_media": media, "xl_total": total,
+                })
+                if n >= 5 and media > mejor_resultado:
+                    mejor_resultado = media
+                    mejor_combo = {"elong_pct": umbral_e, "dist_pct": umbral_d, "n": n,
+                                   "wr": winrate, "media": media, "total": total}
+        mejor_detalle = None
+        if mejor_combo:
+            senales = detectar_senales_continuacion(
+                closes, macd_line, signal_line, pendientes, timestamps_ms,
+                mejor_combo["elong_pct"], mejor_combo["dist_pct"]
+            )
+            results = simular_con_config(senales, closes, "escala_xl", CONFIGS_ELONG["escala_xl"])
+            mejor_detalle = {"senales": results}
+        return jsonify({
+            "simbolo": symbol,
+            "logica": "continuacion",
+            "descripcion": "Continuacion: MACD llega a extremo elongado y gira. SHORT cuando cae desde arriba, LONG cuando sube desde abajo. Sin filtro 4H.",
+            "mejor_combo": mejor_combo,
+            "tabla": resultados,
+            "mejor_detalle": mejor_detalle,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── FIN LABORATORIO CONTINUACIÓN ───
+
 # Arrancar monitor al importar el módulo (funciona con gunicorn Y con python directo)
 if GH_TOKEN:
     _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
