@@ -1985,8 +1985,14 @@ def laboratorio_palmero15(symbol):
 
 # ─── FIN LABORATORIO PALMERO 15 ───
 
-# ─── PAPER TRADING BOT ───
+# ─── PAPER TRADING BOT (BINANCE TESTNET) ───
 import requests as req_lib
+try:
+    from binance.client import Client as BinanceClient
+    from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+    BINANCE_AVAILABLE = True
+except:
+    BINANCE_AVAILABLE = False
 
 PAPER_SL    = 0.03
 PAPER_TP1   = 0.015
@@ -1997,12 +2003,33 @@ PAPER_TRAIL = 0.015
 PAPER_USDT  = 100.0
 PAPER_POLL  = 30
 
+SYMBOLS_PRECISION = {
+    "XRPUSDT": {"qty": 0, "price": 4},
+    "SOLUSDT": {"qty": 1, "price": 2},
+}
+
 _paper_active = {}
 _paper_trades = []
 _paper_lock = threading.Lock()
+_binance_client = None
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "5448802464")
+
+
+def get_binance_client():
+    global _binance_client
+    if _binance_client is None and BINANCE_AVAILABLE:
+        key = os.environ.get("BINANCE_TESTNET_KEY", "")
+        secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
+        if key and secret:
+            try:
+                _binance_client = BinanceClient(key, secret, testnet=True)
+                _binance_client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+                print("[PAPER] Binance testnet conectado")
+            except Exception as e:
+                print(f"[PAPER] Error conectando testnet: {e}")
+    return _binance_client
 
 
 def paper_precio(symbol):
@@ -2023,6 +2050,29 @@ def paper_telegram(msg):
         pass
 
 
+def binance_order(symbol, side, qty):
+    """Ejecuta orden market en testnet. Retorna True si ok."""
+    client = get_binance_client()
+    if not client:
+        print(f"[PAPER] Sin cliente Binance, orden simulada: {symbol} {side} {qty}")
+        return True  # simula ok si no hay cliente
+    try:
+        prec = SYMBOLS_PRECISION.get(symbol, {}).get("qty", 0)
+        qty = round(qty, prec)
+        if prec == 0:
+            qty = int(qty)
+        if qty <= 0:
+            return False
+        order = client.futures_create_order(
+            symbol=symbol, side=side,
+            type=ORDER_TYPE_MARKET, quantity=qty)
+        print(f"[PAPER] Orden ejecutada testnet: {symbol} {side} {qty} -> {order.get('orderId')}")
+        return True
+    except Exception as e:
+        print(f"[PAPER] Error orden testnet: {e}")
+        return False
+
+
 def paper_abrir(symbol, tipo, precio_senal):
     with _paper_lock:
         if symbol in _paper_active:
@@ -2030,6 +2080,26 @@ def paper_abrir(symbol, tipo, precio_senal):
     precio = paper_precio(symbol)
     if not precio:
         return {"error": f"no se pudo obtener precio de {symbol}"}
+
+    qty_total = PAPER_USDT / precio
+    prec = SYMBOLS_PRECISION.get(symbol, {}).get("qty", 0)
+    qty_total = round(qty_total, prec)
+    if prec == 0:
+        qty_total = int(qty_total)
+
+    qty_tp1 = round(qty_total * PAPER_TP1_PESO, prec)
+    qty_tp2 = round(qty_total * PAPER_TP2_PESO, prec)
+    if prec == 0:
+        qty_tp1 = int(qty_tp1)
+        qty_tp2 = int(qty_tp2)
+    qty_caballo = qty_total - qty_tp1 - qty_tp2
+
+    # Ejecutar orden en testnet
+    side = SIDE_BUY if tipo == "LONG" else SIDE_SELL
+    ok = binance_order(symbol, side, qty_total)
+    if not ok:
+        return {"error": "fallo ejecutando orden en testnet"}
+
     if tipo == "LONG":
         sl  = round(precio * (1 - PAPER_SL), 6)
         tp1 = round(precio * (1 + PAPER_TP1), 6)
@@ -2038,26 +2108,52 @@ def paper_abrir(symbol, tipo, precio_senal):
         sl  = round(precio * (1 + PAPER_SL), 6)
         tp1 = round(precio * (1 - PAPER_TP1), 6)
         tp2 = round(precio * (1 - PAPER_TP2), 6)
+
     pos = {
         "symbol": symbol, "tipo": tipo,
         "precio_entrada": precio, "precio_senal": precio_senal,
+        "qty_total": qty_total, "qty_tp1": qty_tp1,
+        "qty_tp2": qty_tp2, "qty_caballo": qty_caballo,
         "sl": sl, "tp1": tp1, "tp2": tp2,
         "tp1_tocado": False, "tp2_tocado": False,
         "breakeven": False, "trailing_activo": False,
         "trailing_stop": None, "mejor_precio": precio,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "usdt": PAPER_USDT,
+        "usdt": PAPER_USDT, "testnet": True,
     }
     with _paper_lock:
         _paper_active[symbol] = pos
+
     emoji = "\U0001f7e2" if tipo == "LONG" else "\U0001f534"
-    paper_telegram(f"{emoji} <b>PAPER TRADE ABIERTO</b>\n"
-        f"{symbol} {tipo}\nEntrada: {precio}\nSL: {sl} (-3%)\n"
-        f"TP1: {tp1} (+1.5%) 40%\nTP2: {tp2} (+2.5%) 30%\nTrailing: 1.5%")
+    paper_telegram(f"{emoji} <b>TESTNET TRADE ABIERTO</b>\n"
+        f"{symbol} {tipo}\nEntrada: {precio}\nCantidad: {qty_total}\nSL: {sl} (-3%)\n"
+        f"TP1: {tp1} (+1.5%) {qty_tp1}\nTP2: {tp2} (+2.5%) {qty_tp2}\n"
+        f"Caballo: {qty_caballo} trailing 1.5%")
     return pos
 
 
+def paper_cerrar_parcial(symbol, qty, razon):
+    """Cierra parte de la posicion en testnet."""
+    pos = _paper_active.get(symbol)
+    if not pos:
+        return
+    side = SIDE_SELL if pos["tipo"] == "LONG" else SIDE_BUY
+    binance_order(symbol, side, qty)
+    print(f"[PAPER] Cerrado parcial {symbol} qty={qty} razon={razon}")
+
+
 def paper_cerrar(symbol, razon, precio_cierre, resultado_pct):
+    # Cerrar lo que quede en testnet
+    pos = _paper_active.get(symbol)
+    if pos:
+        qty_restante = pos["qty_total"]
+        if pos["tp1_tocado"]:
+            qty_restante -= pos["qty_tp1"]
+        if pos["tp2_tocado"]:
+            qty_restante -= pos["qty_tp2"]
+        if qty_restante > 0:
+            paper_cerrar_parcial(symbol, qty_restante, razon)
+
     with _paper_lock:
         pos = _paper_active.pop(symbol, None)
     if not pos:
@@ -2069,7 +2165,7 @@ def paper_cerrar(symbol, razon, precio_cierre, resultado_pct):
     pos["usdt_resultado"] = round(PAPER_USDT * resultado_pct, 2)
     _paper_trades.append(pos)
     emoji = "\u2705" if pos["ganadora"] else "\u274c"
-    paper_telegram(f"{emoji} <b>PAPER CERRADO</b> {razon}\n"
+    paper_telegram(f"{emoji} <b>TESTNET CERRADO</b> {razon}\n"
         f"{symbol} {pos['tipo']}\nEntrada: {pos['precio_entrada']} Cierre: {precio_cierre}\n"
         f"Resultado: {pos['resultado_pct']}%\nP&L: ${pos['usdt_resultado']}")
 
@@ -2107,12 +2203,14 @@ def paper_gestionar(symbol):
             paper_cerrar(symbol, "TRAILING \U0001f40e", precio, t_pct)
             return
     if not pos["tp1_tocado"] and cambio >= PAPER_TP1:
+        paper_cerrar_parcial(symbol, pos["qty_tp1"], "TP1")
         with _paper_lock:
             if symbol in _paper_active:
                 _paper_active[symbol]["tp1_tocado"] = True
                 _paper_active[symbol]["breakeven"] = True
-        paper_telegram(f"\U0001f3af <b>PAPER TP1</b> {symbol} {tipo}\nPrecio: {precio} (+1.5%)\n40% cerrado. Stop breakeven")
+        paper_telegram(f"\U0001f3af <b>TESTNET TP1</b> {symbol} {tipo}\nPrecio: {precio} (+1.5%)\n{pos['qty_tp1']} cerrado. Stop breakeven")
     if pos["tp1_tocado"] and not pos["tp2_tocado"] and cambio >= PAPER_TP2:
+        paper_cerrar_parcial(symbol, pos["qty_tp2"], "TP2")
         with _paper_lock:
             if symbol in _paper_active:
                 _paper_active[symbol]["tp2_tocado"] = True
@@ -2121,7 +2219,7 @@ def paper_gestionar(symbol):
                     _paper_active[symbol]["trailing_stop"] = round(precio * (1 - PAPER_TRAIL), 6)
                 else:
                     _paper_active[symbol]["trailing_stop"] = round(precio * (1 + PAPER_TRAIL), 6)
-        paper_telegram(f"\U0001f3af <b>PAPER TP2</b> {symbol} {tipo}\nPrecio: {precio} (+2.5%)\n30% cerrado. \U0001f40e Trailing 1.5%")
+        paper_telegram(f"\U0001f3af <b>TESTNET TP2</b> {symbol} {tipo}\nPrecio: {precio} (+2.5%)\n{pos['qty_tp2']} cerrado. \U0001f40e Trailing 1.5%")
     if pos["trailing_activo"]:
         with _paper_lock:
             if symbol in _paper_active:
