@@ -1410,6 +1410,157 @@ def laboratorio_elongacion_4h(symbol):
 
 # ─── FIN LABORATORIO ELONGACIÓN 4H ───
 
+# ─── LABORATORIO COMBINADO: ELONGACIÓN + DISTANCIA MACD-SEÑAL ───
+UMBRALES_DISTANCIA = [0.0, 0.0005, 0.001, 0.0015, 0.002, 0.0025, 0.003, 0.004, 0.005]
+UMBRALES_ELONG_COMBO = [0.001, 0.0015, 0.002, 0.0025, 0.003, 0.004]
+
+
+def get_4h_hist_direction(symbol, timestamps_15m_ms):
+    """Dirección 4H basada en histograma (MACD - señal). Verde=alcista, Rojo=bajista."""
+    raw_4h = fetch_klines(symbol, "4h", 500)
+    closes_4h = np.array([float(k[4]) for k in raw_4h])
+    ts_open_4h = [int(k[0]) for k in raw_4h]
+    ts_close_4h = [int(k[6]) for k in raw_4h]
+    macd_4h, sig_4h, _ = calcular_macd(closes_4h)
+    hist_4h = macd_4h - sig_4h
+    dir_map = {}
+    for ts_15m in timestamps_15m_ms:
+        idx_4h = len(ts_open_4h) - 1
+        for j in range(len(ts_open_4h)):
+            if ts_15m >= ts_open_4h[j] and ts_15m <= ts_close_4h[j]:
+                idx_4h = j
+                break
+            elif ts_15m < ts_open_4h[j]:
+                idx_4h = max(0, j - 1)
+                break
+        if idx_4h > 0:
+            idx_4h -= 1
+        if hist_4h[idx_4h] > 0:
+            dir_map[ts_15m] = "alcista"
+        elif hist_4h[idx_4h] < 0:
+            dir_map[ts_15m] = "bajista"
+        else:
+            dir_map[ts_15m] = "lateral"
+    return dir_map
+
+
+def detectar_senales_combo(closes, macd_line, signal_line, pendientes, timestamps_ms, dir_4h_map, umbral_elong, umbral_distancia, gap_min=6):
+    """Señales con elongación + distancia mínima MACD-señal."""
+    senales = []
+    skip = MACD_SLOW + MACD_SIGNAL
+    ultima_senal_idx = -gap_min - 1
+    histograma = macd_line - signal_line
+    for i in range(skip + 1, len(pendientes)):
+        if (i - ultima_senal_idx) < gap_min:
+            continue
+        precio_idx = i + 1
+        if precio_idx >= len(closes):
+            continue
+        ts = timestamps_ms[precio_idx]
+        dir_4h = dir_4h_map.get(ts, "lateral")
+        if dir_4h == "lateral":
+            continue
+        pend_actual = float(pendientes[i])
+        pend_anterior = float(pendientes[i - 1])
+        macd_val = float(macd_line[i])
+        hist_val = abs(float(histograma[i]))
+        if hist_val < umbral_distancia:
+            continue
+        if dir_4h == "alcista" and macd_val < -umbral_elong:
+            if pend_actual > 0 and pend_anterior <= 0:
+                senales.append({
+                    "tipo": "LONG",
+                    "precio": round(float(closes[precio_idx]), 6),
+                    "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "macd_15m": round(macd_val, 8),
+                    "histograma_15m": round(float(histograma[i]), 8),
+                    "direccion_4h": dir_4h,
+                    "vela_idx": int(precio_idx),
+                })
+                ultima_senal_idx = i
+        elif dir_4h == "bajista" and macd_val > umbral_elong:
+            if pend_actual < 0 and pend_anterior >= 0:
+                senales.append({
+                    "tipo": "SHORT",
+                    "precio": round(float(closes[precio_idx]), 6),
+                    "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "macd_15m": round(macd_val, 8),
+                    "histograma_15m": round(float(histograma[i]), 8),
+                    "direccion_4h": dir_4h,
+                    "vela_idx": int(precio_idx),
+                })
+                ultima_senal_idx = i
+    return senales
+
+
+@app.route("/laboratorio_combo/<symbol>")
+def laboratorio_combo(symbol):
+    """Testea combinaciones de elongación + distancia MACD-señal."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    try:
+        raw_15m = fetch_klines_extended(symbol, "15m", 3000)
+        closes = np.array([float(k[4]) for k in raw_15m])
+        timestamps_ms = [int(k[0]) for k in raw_15m]
+        macd_line, signal_line, _ = calcular_macd(closes)
+        pendientes = calcular_pendientes(macd_line)
+        dir_4h_map = get_4h_hist_direction(symbol, timestamps_ms)
+        resultados = []
+        mejor_combo = None
+        mejor_resultado = -999
+        for umbral_e in UMBRALES_ELONG_COMBO:
+            for umbral_d in UMBRALES_DISTANCIA:
+                senales = detectar_senales_combo(
+                    closes, macd_line, signal_line, pendientes, timestamps_ms,
+                    dir_4h_map, umbral_e, umbral_d
+                )
+                for cfg_name, cfg in CONFIGS_ELONG.items():
+                    if cfg_name != "escala_xl":
+                        continue
+                    results = simular_con_config(senales, closes, cfg_name, cfg)
+                    n = len(results)
+                    if n == 0:
+                        resultados.append({
+                            "umbral_elong": umbral_e, "umbral_distancia": umbral_d,
+                            "n_senales": 0, "xl_winrate": 0, "xl_media": 0, "xl_total": 0,
+                        })
+                        continue
+                    ganadoras = sum(1 for r in results if r["ganadora"])
+                    winrate = round(ganadoras / n * 100, 1)
+                    media = round(sum(r["resultado_pct"] for r in results) / n, 3)
+                    total = round(sum(r["resultado_pct"] for r in results), 3)
+                    resultados.append({
+                        "umbral_elong": umbral_e, "umbral_distancia": umbral_d,
+                        "n_senales": n, "xl_winrate": winrate, "xl_media": media, "xl_total": total,
+                    })
+                    if n >= 3 and media > mejor_resultado:
+                        mejor_resultado = media
+                        mejor_combo = {"elong": umbral_e, "dist": umbral_d, "n": n,
+                                       "wr": winrate, "media": media, "total": total}
+        # Detalle del mejor combo
+        mejor_detalle = None
+        if mejor_combo:
+            senales = detectar_senales_combo(
+                closes, macd_line, signal_line, pendientes, timestamps_ms,
+                dir_4h_map, mejor_combo["elong"], mejor_combo["dist"]
+            )
+            results = simular_con_config(senales, closes, "escala_xl", CONFIGS_ELONG["escala_xl"])
+            mejor_detalle = {"senales": results}
+        return jsonify({
+            "simbolo": symbol,
+            "logica": "combo_elongacion_distancia",
+            "descripcion": "Elongación MACD 15m + distancia mínima MACD-señal 15m + histograma 4H",
+            "mejor_combo": mejor_combo,
+            "tabla": resultados,
+            "mejor_detalle": mejor_detalle,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── FIN LABORATORIO COMBINADO ───
+
 # Arrancar monitor al importar el módulo (funciona con gunicorn Y con python directo)
 if GH_TOKEN:
     _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
