@@ -1115,7 +1115,7 @@ def simular_con_config(senales, closes, cfg_name, cfg):
             "macd_15m": s["macd_15m"],
             "resultado_pct": round(resultado_parcial * 100, 3),
             "mejor_pct": round(mejor_pct * 100, 3),
-            "ganadora": resultado_parcial > 0,
+            "ganadora": bool(resultado_parcial > 0),
         })
 
     return resultados
