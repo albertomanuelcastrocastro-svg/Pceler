@@ -1849,6 +1849,142 @@ def laboratorio_relativo_sin4h(symbol):
 
 # ─── FIN LABORATORIO RELATIVO SIN 4H ───
 
+# ─── LABORATORIO PALMERO 15 ───
+P15_SIGNALS_FILE = "signals_log.json"
+P15_TF_MINIMOS = ["15", "60", "240"]  # solo TFs relevantes
+
+
+def leer_signals_log_p15():
+    """Lee signals_log.json (Palmero 15) de GitHub."""
+    if not GH_TOKEN:
+        return []
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{GH_REPO}/contents/{P15_SIGNALS_FILE}",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "User-Agent": "pceler-lab", "Accept": "application/vnd.github+json"},
+            timeout=15)
+        if resp.status_code != 200:
+            return []
+        j = resp.json()
+        decoded = base64.b64decode(j["content"]).decode("utf-8")
+        return json.loads(decoded)
+    except Exception as e:
+        print(f"[LAB P15] Error leyendo signals_log: {e}")
+        return []
+
+
+@app.route("/laboratorio_palmero15/<symbol>")
+def laboratorio_palmero15(symbol):
+    """Simula trades de Palmero 15 con diferentes configs SL/TP."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    try:
+        signals_raw = leer_signals_log_p15()
+        if not signals_raw:
+            return jsonify({"error": "no se pudo leer signals_log.json"}), 500
+        # Filtrar por simbolo y TF >= 15m
+        filtered = []
+        for s in signals_raw:
+            if s.get("simbolo") != symbol:
+                continue
+            if s.get("tf") not in P15_TF_MINIMOS:
+                continue
+            tipo_raw = s.get("tipo", "")
+            if "LONG" in tipo_raw:
+                tipo = "LONG"
+            elif "SHORT" in tipo_raw:
+                tipo = "SHORT"
+            else:
+                continue
+            try:
+                precio = float(s.get("precio", 0))
+            except:
+                continue
+            if precio <= 0:
+                continue
+            filtered.append({
+                "tipo": tipo,
+                "precio": precio,
+                "timestamp": s.get("timestamp", ""),
+                "tf_original": s.get("tf"),
+                "tipo_original": tipo_raw,
+            })
+        if not filtered:
+            return jsonify({"error": "sin senales para ese simbolo en TF >= 15m", "total_raw": len(signals_raw)}), 404
+        # Descargar datos 15m de Binance
+        raw_15m = fetch_klines_extended(symbol, "15m", 3000)
+        closes = np.array([float(k[4]) for k in raw_15m])
+        timestamps_ms = [int(k[0]) for k in raw_15m]
+        # Asignar vela_idx a cada senal
+        senales_con_idx = []
+        for s in filtered:
+            ts_str = s["timestamp"]
+            try:
+                from datetime import datetime as dt
+                if ts_str.endswith("Z"):
+                    ts_str = ts_str[:-1] + "+00:00"
+                ts_dt = dt.fromisoformat(ts_str)
+                ts_ms = int(ts_dt.timestamp() * 1000)
+            except:
+                continue
+            # Encontrar vela 15m mas cercana
+            best_idx = None
+            best_diff = float("inf")
+            for j in range(len(timestamps_ms)):
+                diff = abs(timestamps_ms[j] - ts_ms)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = j
+            if best_idx is not None and best_idx < len(closes) - 50:
+                s["vela_idx"] = best_idx
+                s["macd_15m"] = 0
+                senales_con_idx.append(s)
+        # Simular con diferentes configs
+        resultados_por_config = {}
+        for cfg_name, cfg in CONFIGS_ELONG.items():
+            results = simular_con_config(senales_con_idx, closes, cfg_name, cfg)
+            n = len(results)
+            if n == 0:
+                resultados_por_config[cfg_name] = {"n_senales": 0, "winrate": 0, "resultado_medio": 0}
+                continue
+            ganadoras = sum(1 for r in results if r["ganadora"])
+            winrate = round(ganadoras / n * 100, 1)
+            media = round(sum(r["resultado_pct"] for r in results) / n, 3)
+            total = round(sum(r["resultado_pct"] for r in results), 3)
+            resultados_por_config[cfg_name] = {
+                "n_senales": n, "winrate": winrate,
+                "resultado_medio": media, "total_pct": total,
+                "senales": results,
+            }
+        # Tambien simular con 4 Patas ORO (SL -0.5%, TP1 +0.5%, TP2 +0.8%)
+        cfg_oro = {"sl_pct": -0.005, "tp1_pct": 0.005, "tp1_peso": 0.40,
+            "tp2_pct": 0.008, "tp2_peso": 0.30, "stop_tras_tp1_pct": 0.0}
+        results_oro = simular_con_config(senales_con_idx, closes, "4patas_oro", cfg_oro)
+        n_oro = len(results_oro)
+        if n_oro > 0:
+            g_oro = sum(1 for r in results_oro if r["ganadora"])
+            resultados_por_config["4patas_oro"] = {
+                "n_senales": n_oro, "winrate": round(g_oro / n_oro * 100, 1),
+                "resultado_medio": round(sum(r["resultado_pct"] for r in results_oro) / n_oro, 3),
+                "total_pct": round(sum(r["resultado_pct"] for r in results_oro), 3),
+                "senales": results_oro,
+            }
+        return jsonify({
+            "simbolo": symbol,
+            "descripcion": "Simulacion de senales Palmero 15 (TF >= 15m) con diferentes configs SL/TP",
+            "senales_totales_log": len(signals_raw),
+            "senales_filtradas": len(filtered),
+            "senales_simuladas": len(senales_con_idx),
+            "configs": resultados_por_config,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── FIN LABORATORIO PALMERO 15 ───
+
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
 # Lógica: MACD llega a un extremo (elongado) y empieza a caer/subir desde ahí.
 # SHORT: MACD ESTUVO positivo y elongado, ahora pendiente gira negativa → acompaña la caída
