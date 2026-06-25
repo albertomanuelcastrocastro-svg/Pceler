@@ -1,6 +1,8 @@
 """
-PCELER — Acelerómetro PALMERO (v2.3)
+PCELER — Acelerómetro PALMERO (v2.4)
 ========================================
+v2.4: añade LABORATORIO DE ELONGACIÓN — testea umbrales de elongación
+      del MACD 15m para entradas en bordes (no en el centro).
 v2.3: añade MONITOR automático — graba cada señal en vivo a GitHub
       (pceler_signals_log.json) para auditoría de escala_amplia vs escala_xl.
 v2.2: añade lógica SIMPLIFICADA en paralelo a la de percentiles.
@@ -576,8 +578,8 @@ def calcular_laboratorio_simple(symbol, tf_label, interval, limit, min_racha=3):
 def home():
     return jsonify({
         "servicio": "PCELER — Acelerómetro PALMERO",
-        "version": "2.3",
-        "novedad": "Monitor automático: graba señales en vivo a GitHub para auditoría",
+        "version": "2.4",
+        "novedad": "Laboratorio de elongación: entradas en bordes, no en el centro",
         "endpoints_percentiles": [
             "/estado/<symbol>", "/estado/<symbol>/<tf>",
             "/calibracion/<symbol>",
@@ -590,6 +592,7 @@ def home():
         ],
         "comparativa": "/comparativa/<symbol>/<tf>",
         "monitor": ["/monitor/status", "/monitor/log"],
+        "laboratorio_elongacion": "/laboratorio_elongacion/<symbol>",
     })
 @app.route("/estado/<symbol>")
 def estado_symbol(symbol):
@@ -944,6 +947,268 @@ def monitor_log():
     })
 
 # ─── FIN MONITOR ───
+
+# ─── LABORATORIO ELONGACIÓN ───
+# Testea diferentes umbrales de elongación del MACD 15m
+# Lógica: entrada cuando MACD 15m está elongado EN CONTRA de 4H
+#         y la pendiente gira A FAVOR de 4H
+
+UMBRALES_ELONG = [0.0005, 0.001, 0.0015, 0.002, 0.0025, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008]
+
+CONFIGS_ELONG = {
+    "escala_amplia": {"sl_pct": -0.02, "tp1_pct": 0.01, "tp1_peso": 0.40,
+        "tp2_pct": 0.016, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.01},
+    "escala_xl": {"sl_pct": -0.03, "tp1_pct": 0.015, "tp1_peso": 0.40,
+        "tp2_pct": 0.025, "tp2_peso": 0.30, "stop_tras_tp1_pct": -0.015},
+}
+
+
+def get_4h_direction_for_15m(symbol, timestamps_15m_ms):
+    """Para cada timestamp de 15m, determina dirección de la 4H (pendiente MACD)."""
+    raw_4h = fetch_klines(symbol, "4h", 500)
+    closes_4h = np.array([float(k[4]) for k in raw_4h])
+    ts_open_4h = [int(k[0]) for k in raw_4h]
+    ts_close_4h = [int(k[6]) for k in raw_4h]
+
+    macd_4h, _ = calcular_macd(closes_4h)
+    pend_4h = np.diff(macd_4h)
+
+    dir_map = {}
+    for ts_15m in timestamps_15m_ms:
+        best_idx = len(ts_open_4h) - 1
+        for j in range(len(ts_open_4h)):
+            if ts_15m >= ts_open_4h[j] and ts_15m <= ts_close_4h[j]:
+                best_idx = j
+                break
+            elif ts_15m < ts_open_4h[j]:
+                best_idx = max(0, j - 1)
+                break
+
+        pend_idx = min(best_idx, len(pend_4h) - 1)
+        if pend_idx > 0:
+            pend_idx -= 1  # vela 4H anterior confirmada
+
+        if pend_4h[pend_idx] > 0:
+            dir_map[ts_15m] = "alcista"
+        elif pend_4h[pend_idx] < 0:
+            dir_map[ts_15m] = "bajista"
+        else:
+            dir_map[ts_15m] = "lateral"
+
+    return dir_map
+
+
+def detectar_senales_elongacion(closes, macd_line, pendientes, timestamps_ms, dir_4h_map, umbral_elong, gap_min=6):
+    """
+    Señales con lógica de elongación:
+    - LONG: 4H alcista, MACD 15m < -umbral (elongado en contra), pendiente gira a positivo
+    - SHORT: 4H bajista, MACD 15m > +umbral (elongado en contra), pendiente gira a negativo
+    """
+    senales = []
+    skip = MACD_SLOW + MACD_SIGNAL
+    ultima_senal_idx = -gap_min - 1
+
+    for i in range(skip + 1, len(pendientes)):
+        if (i - ultima_senal_idx) < gap_min:
+            continue
+
+        precio_idx = i + 1
+        if precio_idx >= len(closes):
+            continue
+
+        ts = timestamps_ms[precio_idx]
+        dir_4h = dir_4h_map.get(ts, "lateral")
+        if dir_4h == "lateral":
+            continue
+
+        pend_actual = pendientes[i]
+        pend_anterior = pendientes[i - 1]
+        macd_val = macd_line[i]
+
+        # LONG: 4H alcista, MACD 15m elongado negativo, pendiente gira positiva
+        if dir_4h == "alcista" and macd_val < -umbral_elong:
+            if pend_actual > 0 and pend_anterior <= 0:
+                senales.append({
+                    "tipo": "LONG",
+                    "precio": round(float(closes[precio_idx]), 6),
+                    "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "macd_15m": round(float(macd_val), 8),
+                    "pendiente": round(float(pend_actual), 8),
+                    "direccion_4h": dir_4h,
+                    "vela_idx": int(precio_idx),
+                })
+                ultima_senal_idx = i
+
+        # SHORT: 4H bajista, MACD 15m elongado positivo, pendiente gira negativa
+        elif dir_4h == "bajista" and macd_val > umbral_elong:
+            if pend_actual < 0 and pend_anterior >= 0:
+                senales.append({
+                    "tipo": "SHORT",
+                    "precio": round(float(closes[precio_idx]), 6),
+                    "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "macd_15m": round(float(macd_val), 8),
+                    "pendiente": round(float(pend_actual), 8),
+                    "direccion_4h": dir_4h,
+                    "vela_idx": int(precio_idx),
+                })
+                ultima_senal_idx = i
+
+    return senales
+
+
+def simular_con_config(senales, closes, cfg_name, cfg):
+    """Simula resultados de señales con una config de SL/TP usando velas de 15m."""
+    resultados = []
+    for s in senales:
+        precio_entrada = s["precio"]
+        tipo = s["tipo"]
+        idx = s["vela_idx"]
+
+        sl = cfg["sl_pct"]
+        tp1 = cfg["tp1_pct"]
+        tp2 = cfg["tp2_pct"]
+        tp1_peso = cfg["tp1_peso"]
+        tp2_peso = cfg["tp2_peso"]
+        stop_tras_tp1 = cfg.get("stop_tras_tp1_pct", 0.0)
+
+        max_velas = min(20, len(closes) - idx - 1)
+        mejor_pct = 0.0
+        tp1_tocado = False
+        tp2_tocado = False
+        resultado_parcial = 0.0
+        peso_restante = 1.0
+        cerrado = False
+
+        for v in range(1, max_velas + 1):
+            precio_actual = closes[idx + v]
+            if tipo == "LONG":
+                cambio = (precio_actual - precio_entrada) / precio_entrada
+            else:
+                cambio = (precio_entrada - precio_actual) / precio_entrada
+
+            mejor_pct = max(mejor_pct, cambio)
+
+            if cambio <= sl:
+                resultado_parcial += peso_restante * sl
+                cerrado = True
+                break
+
+            if not tp1_tocado and cambio >= tp1:
+                tp1_tocado = True
+                resultado_parcial += tp1_peso * tp1
+                peso_restante -= tp1_peso
+                sl = stop_tras_tp1
+
+            if not tp2_tocado and cambio >= tp2:
+                tp2_tocado = True
+                resultado_parcial += tp2_peso * tp2
+                peso_restante -= tp2_peso
+
+            if v == max_velas:
+                resultado_parcial += peso_restante * cambio
+                cerrado = True
+
+        resultados.append({
+            "timestamp": s["timestamp"],
+            "tipo": s["tipo"],
+            "precio": s["precio"],
+            "macd_15m": s["macd_15m"],
+            "resultado_pct": round(resultado_parcial * 100, 3),
+            "mejor_pct": round(mejor_pct * 100, 3),
+            "ganadora": resultado_parcial > 0,
+        })
+
+    return resultados
+
+
+@app.route("/laboratorio_elongacion/<symbol>")
+def laboratorio_elongacion(symbol):
+    """Testea diferentes umbrales de elongación del MACD 15m."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+
+    try:
+        raw_15m = fetch_klines(symbol, "15m", 500)
+        closes = np.array([float(k[4]) for k in raw_15m])
+        timestamps_ms = [int(k[0]) for k in raw_15m]
+
+        macd_line, _ = calcular_macd(closes)
+        pendientes = calcular_pendientes(macd_line)
+
+        dir_4h_map = get_4h_direction_for_15m(symbol, timestamps_ms)
+
+        resultados = {}
+        mejor_umbral = None
+        mejor_resultado = -999
+
+        for umbral in UMBRALES_ELONG:
+            senales = detectar_senales_elongacion(
+                closes, macd_line, pendientes, timestamps_ms, dir_4h_map, umbral
+            )
+
+            configs_result = {}
+            for cfg_name, cfg in CONFIGS_ELONG.items():
+                results = simular_con_config(senales, closes, cfg_name, cfg)
+                n = len(results)
+                if n == 0:
+                    configs_result[cfg_name] = {"n_senales": 0, "winrate": 0, "resultado_medio": 0}
+                    continue
+
+                ganadoras = sum(1 for r in results if r["ganadora"])
+                winrate = round(ganadoras / n * 100, 1)
+                resultado_medio = round(sum(r["resultado_pct"] for r in results) / n, 3)
+                total_pct = round(sum(r["resultado_pct"] for r in results), 3)
+
+                configs_result[cfg_name] = {
+                    "n_senales": n,
+                    "winrate": winrate,
+                    "resultado_medio": resultado_medio,
+                    "total_pct": total_pct,
+                    "senales": results,
+                }
+
+                if cfg_name == "escala_xl" and n >= 3 and resultado_medio > mejor_resultado:
+                    mejor_resultado = resultado_medio
+                    mejor_umbral = umbral
+
+            resultados[str(umbral)] = {
+                "umbral": umbral,
+                "n_senales": len(senales),
+                "configs": configs_result,
+            }
+
+        # Tabla resumen
+        resumen = []
+        for umbral in UMBRALES_ELONG:
+            data = resultados[str(umbral)]
+            xl = data["configs"].get("escala_xl", {})
+            amp = data["configs"].get("escala_amplia", {})
+            resumen.append({
+                "umbral": umbral,
+                "n_senales": data["n_senales"],
+                "xl_winrate": xl.get("winrate", 0),
+                "xl_resultado_medio": xl.get("resultado_medio", 0),
+                "xl_total": xl.get("total_pct", 0),
+                "amplia_winrate": amp.get("winrate", 0),
+                "amplia_resultado_medio": amp.get("resultado_medio", 0),
+                "amplia_total": amp.get("total_pct", 0),
+            })
+
+        return jsonify({
+            "simbolo": symbol,
+            "logica": "elongacion",
+            "descripcion": "Entrada cuando MACD 15m elongado EN CONTRA de 4H y pendiente gira A FAVOR",
+            "mejor_umbral_xl": mejor_umbral,
+            "resumen": resumen,
+            "detalle": resultados,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── FIN LABORATORIO ELONGACIÓN ───
 
 # Arrancar monitor al importar el módulo (funciona con gunicorn Y con python directo)
 if GH_TOKEN:
