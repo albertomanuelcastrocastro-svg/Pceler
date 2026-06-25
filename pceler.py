@@ -870,8 +870,8 @@ def gh_write_log(data, sha):
 
 
 def detectar_senales_monitor(symbol):
-    """Detecta señales con lógica relativa (% del precio) + filtro 4H histograma.
-    Coincide exactamente con Pine PCELER v2."""
+    """Detecta señales con lógica relativa (% del precio), SIN filtro 4H.
+    Coincide exactamente con Pine PCELER v2 (filtro desactivado)."""
     try:
         raw = fetch_klines(symbol, "15m", 500)
         if len(raw) < MACD_SLOW + MACD_SIGNAL + 30:
@@ -881,7 +881,6 @@ def detectar_senales_monitor(symbol):
         macd_line, signal_line, _ = calcular_macd(closes)
         pendientes = calcular_pendientes(macd_line)
         histograma = macd_line - signal_line
-        dir_4h_map = get_4h_hist_direction(symbol, timestamps_ms)
         senales = []
         skip = MACD_SLOW + MACD_SIGNAL
         ultima_senal_idx = -7
@@ -890,10 +889,6 @@ def detectar_senales_monitor(symbol):
                 continue
             precio_idx = i + 1
             if precio_idx >= len(closes):
-                continue
-            ts = timestamps_ms[precio_idx]
-            dir_4h = dir_4h_map.get(ts, "lateral")
-            if dir_4h == "lateral":
                 continue
             precio = float(closes[precio_idx])
             if precio <= 0:
@@ -906,25 +901,24 @@ def detectar_senales_monitor(symbol):
             dist_pct = abs(hist_val) / precio * 100
             if dist_pct < MONITOR_DIST_PCT:
                 continue
+            ts = timestamps_ms[precio_idx]
             ts_iso = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
-            if dir_4h == "alcista" and macd_val < 0 and macd_pct >= MONITOR_ELONG_PCT:
+            if macd_val < 0 and macd_pct >= MONITOR_ELONG_PCT:
                 if pend_actual > 0 and pend_anterior <= 0:
                     senales.append({
                         "tipo": "LONG", "precio": round(precio, 6),
                         "timestamp": ts_iso,
                         "macd_pct": round(macd_pct, 4),
                         "dist_pct": round(dist_pct, 4),
-                        "direccion_4h": dir_4h,
                     })
                     ultima_senal_idx = i
-            elif dir_4h == "bajista" and macd_val > 0 and macd_pct >= MONITOR_ELONG_PCT:
+            elif macd_val > 0 and macd_pct >= MONITOR_ELONG_PCT:
                 if pend_actual < 0 and pend_anterior >= 0:
                     senales.append({
                         "tipo": "SHORT", "precio": round(precio, 6),
                         "timestamp": ts_iso,
                         "macd_pct": round(macd_pct, 4),
                         "dist_pct": round(dist_pct, 4),
-                        "direccion_4h": dir_4h,
                     })
                     ultima_senal_idx = i
         return senales
@@ -1003,7 +997,7 @@ def monitor_status():
         "logica": "relativa_al_precio",
         "elong_pct": MONITOR_ELONG_PCT,
         "dist_pct": MONITOR_DIST_PCT,
-        "filtro_4h": "histograma",
+        "filtro_4h": "desactivado",
         "repo": GH_REPO,
         "archivo": GH_LOG_FILE,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1727,6 +1721,125 @@ def laboratorio_relativo(symbol):
         return jsonify({"error": str(e)}), 500
 
 # ─── FIN LABORATORIO RELATIVO ───
+
+# ─── LABORATORIO RELATIVO SIN FILTRO 4H ───
+@app.route("/laboratorio_relativo_sin4h/<symbol>")
+def laboratorio_relativo_sin4h(symbol):
+    """Testea umbrales relativos SIN filtro 4H."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    try:
+        raw_15m = fetch_klines_extended(symbol, "15m", 3000)
+        closes = np.array([float(k[4]) for k in raw_15m])
+        timestamps_ms = [int(k[0]) for k in raw_15m]
+        macd_line, signal_line, _ = calcular_macd(closes)
+        pendientes = calcular_pendientes(macd_line)
+        histograma = macd_line - signal_line
+        resultados = []
+        mejor_combo = None
+        mejor_resultado = -999
+        for umbral_e in UMBRALES_ELONG_REL:
+            for umbral_d in UMBRALES_DIST_REL:
+                senales = []
+                skip = MACD_SLOW + MACD_SIGNAL
+                ultima_idx = -7
+                for i in range(skip + 1, len(pendientes)):
+                    if (i - ultima_idx) < 6:
+                        continue
+                    precio_idx = i + 1
+                    if precio_idx >= len(closes):
+                        continue
+                    precio = float(closes[precio_idx])
+                    if precio <= 0:
+                        continue
+                    pend_actual = float(pendientes[i])
+                    pend_anterior = float(pendientes[i - 1])
+                    macd_val = float(macd_line[i])
+                    hist_val = float(histograma[i])
+                    macd_pct = abs(macd_val) / precio * 100
+                    dist_pct = abs(hist_val) / precio * 100
+                    if dist_pct < umbral_d:
+                        continue
+                    ts = timestamps_ms[precio_idx]
+                    ts_iso = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+                    if macd_val < 0 and macd_pct >= umbral_e:
+                        if pend_actual > 0 and pend_anterior <= 0:
+                            senales.append({"tipo": "LONG", "precio": round(precio, 6),
+                                "timestamp": ts_iso, "macd_pct": round(macd_pct, 4),
+                                "vela_idx": int(precio_idx)})
+                            ultima_idx = i
+                    elif macd_val > 0 and macd_pct >= umbral_e:
+                        if pend_actual < 0 and pend_anterior >= 0:
+                            senales.append({"tipo": "SHORT", "precio": round(precio, 6),
+                                "timestamp": ts_iso, "macd_pct": round(macd_pct, 4),
+                                "vela_idx": int(precio_idx)})
+                            ultima_idx = i
+                results = simular_con_config(senales, closes, "escala_xl", CONFIGS_ELONG["escala_xl"])
+                n = len(results)
+                if n == 0:
+                    resultados.append({"elong_pct": umbral_e, "dist_pct": umbral_d,
+                        "n_senales": 0, "xl_winrate": 0, "xl_media": 0, "xl_total": 0})
+                    continue
+                ganadoras = sum(1 for r in results if r["ganadora"])
+                winrate = round(ganadoras / n * 100, 1)
+                media = round(sum(r["resultado_pct"] for r in results) / n, 3)
+                total = round(sum(r["resultado_pct"] for r in results), 3)
+                resultados.append({"elong_pct": umbral_e, "dist_pct": umbral_d,
+                    "n_senales": n, "xl_winrate": winrate, "xl_media": media, "xl_total": total})
+                if n >= 5 and media > mejor_resultado:
+                    mejor_resultado = media
+                    mejor_combo = {"elong_pct": umbral_e, "dist_pct": umbral_d, "n": n,
+                                   "wr": winrate, "media": media, "total": total}
+        mejor_detalle = None
+        if mejor_combo:
+            senales_det = []
+            skip = MACD_SLOW + MACD_SIGNAL
+            ultima_idx = -7
+            for i in range(skip + 1, len(pendientes)):
+                if (i - ultima_idx) < 6:
+                    continue
+                precio_idx = i + 1
+                if precio_idx >= len(closes):
+                    continue
+                precio = float(closes[precio_idx])
+                if precio <= 0:
+                    continue
+                pend_actual = float(pendientes[i])
+                pend_anterior = float(pendientes[i - 1])
+                macd_val = float(macd_line[i])
+                hist_val = float(histograma[i])
+                macd_pct = abs(macd_val) / precio * 100
+                dist_pct = abs(hist_val) / precio * 100
+                if dist_pct < mejor_combo["dist_pct"]:
+                    continue
+                ts = timestamps_ms[precio_idx]
+                ts_iso = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+                if macd_val < 0 and macd_pct >= mejor_combo["elong_pct"]:
+                    if pend_actual > 0 and pend_anterior <= 0:
+                        senales_det.append({"tipo": "LONG", "precio": round(precio, 6),
+                            "timestamp": ts_iso, "macd_pct": round(macd_pct, 4),
+                            "vela_idx": int(precio_idx)})
+                        ultima_idx = i
+                elif macd_val > 0 and macd_pct >= mejor_combo["elong_pct"]:
+                    if pend_actual < 0 and pend_anterior >= 0:
+                        senales_det.append({"tipo": "SHORT", "precio": round(precio, 6),
+                            "timestamp": ts_iso, "macd_pct": round(macd_pct, 4),
+                            "vela_idx": int(precio_idx)})
+                        ultima_idx = i
+            results = simular_con_config(senales_det, closes, "escala_xl", CONFIGS_ELONG["escala_xl"])
+            mejor_detalle = {"senales": results}
+        return jsonify({
+            "simbolo": symbol, "logica": "relativo_sin_filtro_4h",
+            "descripcion": "Umbrales relativos SIN filtro 4H",
+            "mejor_combo": mejor_combo, "tabla": resultados,
+            "mejor_detalle": mejor_detalle,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── FIN LABORATORIO RELATIVO SIN 4H ───
 
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
 # Lógica: MACD llega a un extremo (elongado) y empieza a caer/subir desde ahí.
