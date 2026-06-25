@@ -81,6 +81,38 @@ def fetch_klines(symbol, interval, limit=500):
     raw = resp.json()
     _cache[key] = {"ts": now, "data": raw}
     return raw
+
+def fetch_klines_extended(symbol, interval, total=3000):
+    """Fetch más de 1000 velas haciendo múltiples llamadas a Binance."""
+    all_klines = []
+    end_time = None
+    remaining = total
+    while remaining > 0:
+        batch = min(remaining, 1000)
+        url = f"{BINANCE_BASE}?symbol={symbol}&interval={interval}&limit={batch}"
+        if end_time:
+            url += f"&endTime={end_time}"
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        raw = resp.json()
+        if not raw:
+            break
+        all_klines = raw + all_klines  # prepend (oldest first)
+        end_time = int(raw[0][0]) - 1  # antes de la primera vela de este batch
+        remaining -= len(raw)
+        if len(raw) < batch:
+            break
+        time.sleep(0.2)  # no saturar Binance
+    # Eliminar duplicados por timestamp
+    seen = set()
+    unique = []
+    for k in all_klines:
+        ts = int(k[0])
+        if ts not in seen:
+            seen.add(ts)
+            unique.append(k)
+    unique.sort(key=lambda x: int(x[0]))
+    return unique
 def ema(values, period):
     alpha = 2 / (period + 1)
     result = np.zeros_like(values, dtype=float)
@@ -1129,7 +1161,7 @@ def laboratorio_elongacion(symbol):
         return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
 
     try:
-        raw_15m = fetch_klines(symbol, "15m", 500)
+        raw_15m = fetch_klines_extended(symbol, "15m", 3000)
         closes = np.array([float(k[4]) for k in raw_15m])
         timestamps_ms = [int(k[0]) for k in raw_15m]
 
