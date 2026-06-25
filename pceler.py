@@ -1242,6 +1242,174 @@ def laboratorio_elongacion(symbol):
 
 # ─── FIN LABORATORIO ELONGACIÓN ───
 
+# ─── LABORATORIO ELONGACIÓN 4H (fractal) ───
+UMBRALES_ELONG_4H = [0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.01, 0.012, 0.015]
+UMBRAL_15M_FIJO = 0.0025
+
+
+def calcular_zonas_4h(macd_4h, umbral_4h):
+    """Zonas LONG/SHORT basadas en cruces del MACD 4H por cero, solo si venía de ±umbral."""
+    zonas = []
+    modo_actual = None
+    max_positivo = 0.0
+    min_negativo = 0.0
+    for i in range(1, len(macd_4h)):
+        val = float(macd_4h[i])
+        val_prev = float(macd_4h[i - 1])
+        if val > 0:
+            max_positivo = max(max_positivo, val)
+        elif val < 0:
+            min_negativo = min(min_negativo, val)
+        if val_prev <= 0 and val > 0:
+            if abs(min_negativo) >= umbral_4h:
+                if modo_actual != "LONG":
+                    modo_actual = "LONG"
+                    zonas.append({"inicio": i, "modo": "LONG"})
+                min_negativo = 0.0
+                max_positivo = val
+        elif val_prev >= 0 and val < 0:
+            if max_positivo >= umbral_4h:
+                if modo_actual != "SHORT":
+                    modo_actual = "SHORT"
+                    zonas.append({"inicio": i, "modo": "SHORT"})
+                max_positivo = 0.0
+                min_negativo = val
+    for j in range(len(zonas)):
+        if j + 1 < len(zonas):
+            zonas[j]["fin"] = zonas[j + 1]["inicio"]
+        else:
+            zonas[j]["fin"] = len(macd_4h)
+    return zonas
+
+
+def modo_4h_en_timestamp(zonas_4h, ts_open_4h, ts_close_4h, ts_15m):
+    """Dado un timestamp de 15m, retorna el modo 4H (LONG/SHORT/None)."""
+    idx_4h = len(ts_open_4h) - 1
+    for j in range(len(ts_open_4h)):
+        if ts_15m >= ts_open_4h[j] and ts_15m <= ts_close_4h[j]:
+            idx_4h = j
+            break
+        elif ts_15m < ts_open_4h[j]:
+            idx_4h = max(0, j - 1)
+            break
+    for z in zonas_4h:
+        if z["inicio"] <= idx_4h < z["fin"]:
+            return z["modo"]
+    return None
+
+
+@app.route("/laboratorio_elongacion_4h/<symbol>")
+def laboratorio_elongacion_4h(symbol):
+    """Testea umbrales de elongación del MACD 4H (lógica fractal)."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return jsonify({"error": f"simbolo no soportado: {symbol}"}), 400
+    try:
+        raw_15m = fetch_klines_extended(symbol, "15m", 3000)
+        closes_15m = np.array([float(k[4]) for k in raw_15m])
+        timestamps_15m_ms = [int(k[0]) for k in raw_15m]
+        macd_15m, _, _ = calcular_macd(closes_15m)
+        pendientes_15m = calcular_pendientes(macd_15m)
+        raw_4h = fetch_klines(symbol, "4h", 500)
+        closes_4h = np.array([float(k[4]) for k in raw_4h])
+        ts_open_4h = [int(k[0]) for k in raw_4h]
+        ts_close_4h = [int(k[6]) for k in raw_4h]
+        macd_4h, _, _ = calcular_macd(closes_4h)
+        resultados = {}
+        mejor_umbral = None
+        mejor_resultado = -999
+        for umbral_4h in UMBRALES_ELONG_4H:
+            zonas = calcular_zonas_4h(macd_4h, umbral_4h)
+            senales = []
+            skip = MACD_SLOW + MACD_SIGNAL
+            ultima_senal_idx = -7
+            for i in range(skip + 1, len(pendientes_15m)):
+                if (i - ultima_senal_idx) < 6:
+                    continue
+                precio_idx = i + 1
+                if precio_idx >= len(closes_15m):
+                    continue
+                ts = timestamps_15m_ms[precio_idx]
+                modo = modo_4h_en_timestamp(zonas, ts_open_4h, ts_close_4h, ts)
+                if modo is None:
+                    continue
+                pend_actual = float(pendientes_15m[i])
+                pend_anterior = float(pendientes_15m[i - 1])
+                macd_val = float(macd_15m[i])
+                if modo == "LONG" and macd_val < -UMBRAL_15M_FIJO:
+                    if pend_actual > 0 and pend_anterior <= 0:
+                        senales.append({
+                            "tipo": "LONG",
+                            "precio": round(float(closes_15m[precio_idx]), 6),
+                            "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                            "macd_15m": round(macd_val, 8),
+                            "modo_4h": modo,
+                            "vela_idx": int(precio_idx),
+                        })
+                        ultima_senal_idx = i
+                elif modo == "SHORT" and macd_val > UMBRAL_15M_FIJO:
+                    if pend_actual < 0 and pend_anterior >= 0:
+                        senales.append({
+                            "tipo": "SHORT",
+                            "precio": round(float(closes_15m[precio_idx]), 6),
+                            "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                            "macd_15m": round(macd_val, 8),
+                            "modo_4h": modo,
+                            "vela_idx": int(precio_idx),
+                        })
+                        ultima_senal_idx = i
+            configs_result = {}
+            for cfg_name, cfg in CONFIGS_ELONG.items():
+                results = simular_con_config(senales, closes_15m, cfg_name, cfg)
+                n = len(results)
+                if n == 0:
+                    configs_result[cfg_name] = {"n_senales": 0, "winrate": 0, "resultado_medio": 0}
+                    continue
+                ganadoras = sum(1 for r in results if r["ganadora"])
+                winrate = round(ganadoras / n * 100, 1)
+                resultado_medio = round(sum(r["resultado_pct"] for r in results) / n, 3)
+                total_pct = round(sum(r["resultado_pct"] for r in results), 3)
+                configs_result[cfg_name] = {
+                    "n_senales": n, "winrate": winrate,
+                    "resultado_medio": resultado_medio, "total_pct": total_pct,
+                    "senales": results,
+                }
+                if cfg_name == "escala_xl" and n >= 3 and resultado_medio > mejor_resultado:
+                    mejor_resultado = resultado_medio
+                    mejor_umbral = umbral_4h
+            n_zonas_long = sum(1 for z in zonas if z["modo"] == "LONG")
+            n_zonas_short = sum(1 for z in zonas if z["modo"] == "SHORT")
+            resultados[str(umbral_4h)] = {
+                "umbral_4h": umbral_4h, "umbral_15m_fijo": UMBRAL_15M_FIJO,
+                "n_zonas_long": n_zonas_long, "n_zonas_short": n_zonas_short,
+                "n_senales": len(senales), "configs": configs_result,
+            }
+        resumen = []
+        for umbral_4h in UMBRALES_ELONG_4H:
+            data = resultados[str(umbral_4h)]
+            xl = data["configs"].get("escala_xl", {})
+            amp = data["configs"].get("escala_amplia", {})
+            resumen.append({
+                "umbral_4h": umbral_4h, "n_senales": data["n_senales"],
+                "zonas_L": data["n_zonas_long"], "zonas_S": data["n_zonas_short"],
+                "xl_winrate": xl.get("winrate", 0),
+                "xl_resultado_medio": xl.get("resultado_medio", 0),
+                "xl_total": xl.get("total_pct", 0),
+                "amplia_winrate": amp.get("winrate", 0),
+                "amplia_resultado_medio": amp.get("resultado_medio", 0),
+                "amplia_total": amp.get("total_pct", 0),
+            })
+        return jsonify({
+            "simbolo": symbol, "logica": "elongacion_fractal_4h",
+            "descripcion": "Fractal: umbral 4H para zonas LONG/SHORT (cruce por cero solo si venia de +-umbral) + 15m con elongacion 0.0025",
+            "mejor_umbral_4h_xl": mejor_umbral, "resumen": resumen,
+            "detalle": resultados, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── FIN LABORATORIO ELONGACIÓN 4H ───
+
 # Arrancar monitor al importar el módulo (funciona con gunicorn Y con python directo)
 if GH_TOKEN:
     _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
