@@ -2246,6 +2246,16 @@ def paper_monitor_loop():
         time.sleep(PAPER_POLL)
 
 
+@app.route("/paper/abrir/<symbol>/<tipo>")
+def paper_abrir_manual(symbol, tipo):
+    symbol = symbol.upper()
+    tipo = tipo.upper()
+    if tipo not in ("LONG", "SHORT"):
+        return jsonify({"error": "tipo debe ser LONG o SHORT"}), 400
+    resultado = paper_abrir(symbol, tipo, 0)
+    return jsonify(resultado)
+
+
 @app.route("/paper")
 def paper_home():
     return jsonify({
