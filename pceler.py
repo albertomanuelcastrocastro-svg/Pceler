@@ -2024,11 +2024,16 @@ def get_binance_client():
         secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
         if key and secret:
             try:
-                _binance_client = BinanceClient(key, secret, testnet=True)
+                _binance_client = BinanceClient(key, secret, tld='com')
                 _binance_client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-                print("[PAPER] Binance testnet conectado")
+                _binance_client.FUTURES_TESTNET_URL = "https://testnet.binancefuture.com/fapi"
+                _binance_client.API_URL = "https://testnet.binancefuture.com/fapi"
+                # Verificar conexion
+                _binance_client.futures_ping()
+                print("[PAPER] Binance futures testnet conectado OK")
             except Exception as e:
                 print(f"[PAPER] Error conectando testnet: {e}")
+                _binance_client = None
     return _binance_client
 
 
@@ -2371,18 +2376,28 @@ def test_binance():
     resultados["python_binance_disponible"] = BINANCE_AVAILABLE
     resultados["testnet_key_configurada"] = bool(os.environ.get("BINANCE_TESTNET_KEY", ""))
     resultados["testnet_secret_configurada"] = bool(os.environ.get("BINANCE_TESTNET_SECRET", ""))
-    client = get_binance_client()
-    if client:
+    # Intentar crear cliente aqui directamente para capturar error
+    if BINANCE_AVAILABLE:
+        key = os.environ.get("BINANCE_TESTNET_KEY", "")
+        secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
         try:
-            balance = client.futures_account_balance()
-            for b in balance:
-                if float(b.get("balance", 0)) > 0:
-                    resultados["testnet_balance_" + b["asset"]] = float(b["balance"])
-            resultados["cliente_testnet"] = "CONECTADO"
+            test_client = BinanceClient(key, secret, tld='com')
+            test_client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+            test_client.API_URL = "https://testnet.binancefuture.com/fapi"
+            ping = test_client.futures_ping()
+            resultados["cliente_testnet"] = f"CONECTADO - ping: {ping}"
+            # Intentar ver balance
+            try:
+                balance = test_client.futures_account_balance()
+                for b in balance:
+                    if float(b.get("balance", 0)) > 0:
+                        resultados["testnet_balance_" + b["asset"]] = float(b["balance"])
+            except Exception as e2:
+                resultados["balance_error"] = str(e2)
         except Exception as e:
             resultados["cliente_testnet"] = f"ERROR: {str(e)}"
     else:
-        resultados["cliente_testnet"] = "NO INICIALIZADO"
+        resultados["cliente_testnet"] = "LIBRERIA NO DISPONIBLE"
     return jsonify(resultados)
 
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
