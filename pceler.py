@@ -1987,12 +1987,9 @@ def laboratorio_palmero15(symbol):
 
 # ─── PAPER TRADING BOT (BINANCE TESTNET) ───
 import requests as req_lib
-try:
-    from binance.client import Client as BinanceClient
-    from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
-    BINANCE_AVAILABLE = True
-except:
-    BINANCE_AVAILABLE = False
+import hmac
+import hashlib
+from urllib.parse import urlencode
 
 PAPER_SL    = 0.03
 PAPER_TP1   = 0.015
@@ -2003,6 +2000,8 @@ PAPER_TRAIL = 0.015
 PAPER_USDT  = 100.0
 PAPER_POLL  = 30
 
+TESTNET_BASE = "https://testnet.binancefuture.com"
+
 SYMBOLS_PRECISION = {
     "XRPUSDT": {"qty": 0, "price": 4},
     "SOLUSDT": {"qty": 1, "price": 2},
@@ -2011,30 +2010,56 @@ SYMBOLS_PRECISION = {
 _paper_active = {}
 _paper_trades = []
 _paper_lock = threading.Lock()
-_binance_client = None
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "5448802464")
 
 
-def get_binance_client():
-    global _binance_client
-    if _binance_client is None and BINANCE_AVAILABLE:
-        key = os.environ.get("BINANCE_TESTNET_KEY", "")
-        secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
-        if key and secret:
-            try:
-                _binance_client = BinanceClient(key, secret, tld='com')
-                _binance_client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-                _binance_client.FUTURES_TESTNET_URL = "https://testnet.binancefuture.com/fapi"
-                _binance_client.API_URL = "https://testnet.binancefuture.com/fapi"
-                # Verificar conexion
-                _binance_client.futures_ping()
-                print("[PAPER] Binance futures testnet conectado OK")
-            except Exception as e:
-                print(f"[PAPER] Error conectando testnet: {e}")
-                _binance_client = None
-    return _binance_client
+def testnet_sign(params):
+    """Firma parametros con HMAC-SHA256 para Binance testnet."""
+    secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
+    query = urlencode(params)
+    signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return query + "&signature=" + signature
+
+
+def testnet_headers():
+    key = os.environ.get("BINANCE_TESTNET_KEY", "")
+    return {"X-MBX-APIKEY": key}
+
+
+def testnet_order(symbol, side, qty):
+    """Ejecuta orden market en testnet via API directa."""
+    key = os.environ.get("BINANCE_TESTNET_KEY", "")
+    if not key:
+        print("[PAPER] Sin claves testnet, orden solo local")
+        return {"local": True}
+    try:
+        prec = SYMBOLS_PRECISION.get(symbol, {}).get("qty", 0)
+        qty = round(qty, prec)
+        if prec == 0:
+            qty = int(qty)
+        if qty <= 0:
+            return None
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+            "timestamp": int(time.time() * 1000),
+        }
+        signed = testnet_sign(params)
+        url = f"{TESTNET_BASE}/fapi/v1/order?{signed}"
+        r = req_lib.post(url, headers=testnet_headers(), timeout=10)
+        result = r.json()
+        if r.status_code == 200:
+            print(f"[PAPER] Orden testnet OK: {symbol} {side} {qty} -> orderId={result.get('orderId')}")
+        else:
+            print(f"[PAPER] Orden testnet ERROR: {result}")
+        return result
+    except Exception as e:
+        print(f"[PAPER] Error orden testnet: {e}")
+        return {"error": str(e)}
 
 
 def paper_precio(symbol):
@@ -2053,29 +2078,6 @@ def paper_telegram(msg):
             json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"}, timeout=10)
     except:
         pass
-
-
-def binance_order(symbol, side, qty):
-    """Ejecuta orden market en testnet. Retorna True si ok."""
-    client = get_binance_client()
-    if not client:
-        print(f"[PAPER] Sin cliente Binance, orden simulada: {symbol} {side} {qty}")
-        return True  # simula ok si no hay cliente
-    try:
-        prec = SYMBOLS_PRECISION.get(symbol, {}).get("qty", 0)
-        qty = round(qty, prec)
-        if prec == 0:
-            qty = int(qty)
-        if qty <= 0:
-            return False
-        order = client.futures_create_order(
-            symbol=symbol, side=side,
-            type=ORDER_TYPE_MARKET, quantity=qty)
-        print(f"[PAPER] Orden ejecutada testnet: {symbol} {side} {qty} -> {order.get('orderId')}")
-        return True
-    except Exception as e:
-        print(f"[PAPER] Error orden testnet: {e}")
-        return False
 
 
 def paper_abrir(symbol, tipo, precio_senal):
@@ -2100,10 +2102,10 @@ def paper_abrir(symbol, tipo, precio_senal):
     qty_caballo = qty_total - qty_tp1 - qty_tp2
 
     # Ejecutar orden en testnet
-    side = SIDE_BUY if tipo == "LONG" else SIDE_SELL
-    ok = binance_order(symbol, side, qty_total)
-    if not ok:
-        return {"error": "fallo ejecutando orden en testnet"}
+    side = "BUY" if tipo == "LONG" else "SELL"
+    result = testnet_order(symbol, side, qty_total)
+    if result is None:
+        return {"error": "cantidad invalida"}
 
     if tipo == "LONG":
         sl  = round(precio * (1 - PAPER_SL), 6)
@@ -2125,6 +2127,7 @@ def paper_abrir(symbol, tipo, precio_senal):
         "trailing_stop": None, "mejor_precio": precio,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "usdt": PAPER_USDT, "testnet": True,
+        "binance_result": result,
     }
     with _paper_lock:
         _paper_active[symbol] = pos
@@ -2138,17 +2141,15 @@ def paper_abrir(symbol, tipo, precio_senal):
 
 
 def paper_cerrar_parcial(symbol, qty, razon):
-    """Cierra parte de la posicion en testnet."""
     pos = _paper_active.get(symbol)
     if not pos:
         return
-    side = SIDE_SELL if pos["tipo"] == "LONG" else SIDE_BUY
-    binance_order(symbol, side, qty)
+    side = "SELL" if pos["tipo"] == "LONG" else "BUY"
+    testnet_order(symbol, side, qty)
     print(f"[PAPER] Cerrado parcial {symbol} qty={qty} razon={razon}")
 
 
 def paper_cerrar(symbol, razon, precio_cierre, resultado_pct):
-    # Cerrar lo que quede en testnet
     pos = _paper_active.get(symbol)
     if pos:
         qty_restante = pos["qty_total"]
@@ -2372,32 +2373,29 @@ def test_binance():
         resultados["testnet.binancefuture.com"] = {"ok": True, "respuesta": r.json()}
     except Exception as e:
         resultados["testnet.binancefuture.com"] = {"ok": False, "error": str(e)}
-    # Test cliente Binance
-    resultados["python_binance_disponible"] = BINANCE_AVAILABLE
+    # Test cliente directo al testnet
     resultados["testnet_key_configurada"] = bool(os.environ.get("BINANCE_TESTNET_KEY", ""))
     resultados["testnet_secret_configurada"] = bool(os.environ.get("BINANCE_TESTNET_SECRET", ""))
-    # Intentar crear cliente aqui directamente para capturar error
-    if BINANCE_AVAILABLE:
-        key = os.environ.get("BINANCE_TESTNET_KEY", "")
-        secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
+    key = os.environ.get("BINANCE_TESTNET_KEY", "")
+    secret = os.environ.get("BINANCE_TESTNET_SECRET", "")
+    if key and secret:
         try:
-            test_client = BinanceClient(key, secret, tld='com')
-            test_client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-            test_client.API_URL = "https://testnet.binancefuture.com/fapi"
-            ping = test_client.futures_ping()
-            resultados["cliente_testnet"] = f"CONECTADO - ping: {ping}"
-            # Intentar ver balance
-            try:
-                balance = test_client.futures_account_balance()
-                for b in balance:
+            params = {"timestamp": int(time.time() * 1000)}
+            signed = testnet_sign(params)
+            url = f"{TESTNET_BASE}/fapi/v2/balance?{signed}"
+            r = req_lib.get(url, headers=testnet_headers(), timeout=10)
+            if r.status_code == 200:
+                balances = r.json()
+                for b in balances:
                     if float(b.get("balance", 0)) > 0:
                         resultados["testnet_balance_" + b["asset"]] = float(b["balance"])
-            except Exception as e2:
-                resultados["balance_error"] = str(e2)
+                resultados["cliente_testnet"] = "CONECTADO Y AUTENTICADO"
+            else:
+                resultados["cliente_testnet"] = f"ERROR {r.status_code}: {r.text[:200]}"
         except Exception as e:
             resultados["cliente_testnet"] = f"ERROR: {str(e)}"
     else:
-        resultados["cliente_testnet"] = "LIBRERIA NO DISPONIBLE"
+        resultados["cliente_testnet"] = "SIN CLAVES"
     return jsonify(resultados)
 
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
