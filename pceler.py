@@ -2367,6 +2367,22 @@ def test_binance():
         resultados["testnet.binancefuture.com"] = {"ok": True, "respuesta": r.json()}
     except Exception as e:
         resultados["testnet.binancefuture.com"] = {"ok": False, "error": str(e)}
+    # Test cliente Binance
+    resultados["python_binance_disponible"] = BINANCE_AVAILABLE
+    resultados["testnet_key_configurada"] = bool(os.environ.get("BINANCE_TESTNET_KEY", ""))
+    resultados["testnet_secret_configurada"] = bool(os.environ.get("BINANCE_TESTNET_SECRET", ""))
+    client = get_binance_client()
+    if client:
+        try:
+            balance = client.futures_account_balance()
+            for b in balance:
+                if float(b.get("balance", 0)) > 0:
+                    resultados["testnet_balance_" + b["asset"]] = float(b["balance"])
+            resultados["cliente_testnet"] = "CONECTADO"
+        except Exception as e:
+            resultados["cliente_testnet"] = f"ERROR: {str(e)}"
+    else:
+        resultados["cliente_testnet"] = "NO INICIALIZADO"
     return jsonify(resultados)
 
 # ─── LABORATORIO CONTINUACIÓN: entrar A FAVOR del movimiento del MACD ───
