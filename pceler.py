@@ -2294,8 +2294,14 @@ def paper_webhook():
             except: pass
         if not tipo or not symbol:
             return jsonify({"error": "formato invalido"}), 400
-        resultado = paper_abrir(symbol, tipo, precio)
-        return jsonify({"ok": True, "trade": resultado})
+        # Disparar los dos bots en paralelo
+        resultado_binance = paper_abrir(symbol, tipo, precio)
+        resultado_cb = cb_abrir(symbol, tipo, precio)
+        return jsonify({
+            "ok": True,
+            "binance_testnet": resultado_binance,
+            "coinbase_sandbox": resultado_cb
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2373,6 +2379,342 @@ _paper_thread = threading.Thread(target=paper_monitor_loop, daemon=True)
 _paper_thread.start()
 
 # ─── FIN PAPER TRADING ───
+
+# ─── COINBASE SANDBOX BOT ───
+COINBASE_SANDBOX_URL = "https://api-sandbox.coinbase.com/api/v3/brokerage"
+
+# Mapeo de simbolos Binance → Coinbase
+COINBASE_SYMBOLS = {
+    "XRPUSDT": "XRP-USDT",
+    "SOLUSDT": "SOL-USDT",
+    "XRPUSDC": "XRP-USDC",
+    "SOLUSDC": "SOL-USDC",
+}
+
+_cb_active = {}   # trade_id -> posicion
+_cb_trades = []
+_cb_lock = threading.Lock()
+_cb_next_id = 1
+
+
+def cb_precio(symbol):
+    """Precio de Coinbase sandbox (o Binance publica como fallback)."""
+    cb_symbol = COINBASE_SYMBOLS.get(symbol, symbol)
+    try:
+        r = req_lib.get(
+            f"{COINBASE_SANDBOX_URL}/market/products/{cb_symbol}/ticker",
+            timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            price = data.get("price") or data.get("ask") or data.get("bid")
+            if price:
+                return float(price)
+    except:
+        pass
+    # Fallback a Binance publica
+    return paper_precio(symbol)
+
+
+def cb_order(symbol, side, qty, trade_id):
+    """Simula orden en Coinbase sandbox."""
+    cb_symbol = COINBASE_SYMBOLS.get(symbol, symbol)
+    try:
+        import uuid
+        order_payload = {
+            "client_order_id": str(uuid.uuid4()),
+            "product_id": cb_symbol,
+            "side": side,
+            "order_configuration": {
+                "market_market_ioc": {
+                    "base_size": str(round(qty, 4))
+                }
+            }
+        }
+        r = req_lib.post(
+            f"{COINBASE_SANDBOX_URL}/orders",
+            json=order_payload,
+            timeout=10)
+        result = r.json()
+        print(f"[CB] Orden sandbox: {symbol} {side} {qty} -> {result}")
+        return result
+    except Exception as e:
+        print(f"[CB] Error orden sandbox: {e}")
+        return {"error": str(e)}
+
+
+def cb_abrir(symbol, tipo, precio_senal):
+    global _cb_next_id
+    precio = cb_precio(symbol) or paper_precio(symbol)
+    if not precio:
+        return {"error": f"no se pudo obtener precio de {symbol}"}
+
+    qty_total = PAPER_USDT / precio
+    prec = SYMBOLS_PRECISION.get(symbol, {}).get("qty", 0)
+    qty_total = round(qty_total, prec)
+    if prec == 0:
+        qty_total = int(qty_total)
+
+    qty_tp1 = round(qty_total * PAPER_TP1_PESO, prec)
+    qty_tp2 = round(qty_total * PAPER_TP2_PESO, prec)
+    if prec == 0:
+        qty_tp1 = int(qty_tp1)
+        qty_tp2 = int(qty_tp2)
+    qty_caballo = qty_total - qty_tp1 - qty_tp2
+
+    with _cb_lock:
+        trade_id = f"CB_{symbol}_{_cb_next_id}"
+        _cb_next_id += 1
+
+    side = "BUY" if tipo == "LONG" else "SELL"
+    result = cb_order(symbol, side, qty_total, trade_id)
+
+    if tipo == "LONG":
+        sl  = round(precio * (1 - PAPER_SL), 6)
+        tp1 = round(precio * (1 + PAPER_TP1), 6)
+        tp2 = round(precio * (1 + PAPER_TP2), 6)
+    else:
+        sl  = round(precio * (1 + PAPER_SL), 6)
+        tp1 = round(precio * (1 - PAPER_TP1), 6)
+        tp2 = round(precio * (1 - PAPER_TP2), 6)
+
+    pos = {
+        "trade_id": trade_id, "exchange": "coinbase_sandbox",
+        "symbol": symbol, "tipo": tipo,
+        "precio_entrada": precio, "precio_senal": precio_senal,
+        "qty_total": qty_total, "qty_tp1": qty_tp1,
+        "qty_tp2": qty_tp2, "qty_caballo": qty_caballo,
+        "sl": sl, "tp1": tp1, "tp2": tp2,
+        "tp1_tocado": False, "tp2_tocado": False,
+        "breakeven": False, "trailing_activo": False,
+        "trailing_stop": None, "mejor_precio": precio,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "usdt": PAPER_USDT, "cb_result": result,
+    }
+    with _cb_lock:
+        _cb_active[trade_id] = pos
+
+    emoji = "\U0001f7e2" if tipo == "LONG" else "\U0001f534"
+    paper_telegram(f"{emoji} <b>COINBASE SANDBOX ABIERTO</b>\n"
+        f"{trade_id}\n{symbol} {tipo}\nEntrada: {precio}\nCantidad: {qty_total}\n"
+        f"SL: {sl} (-3%) | TP1: {tp1} (+1.5%) | TP2: {tp2} (+2.5%)")
+    return pos
+
+
+def cb_cerrar_parcial(trade_id, qty, razon):
+    pos = _cb_active.get(trade_id)
+    if not pos:
+        return
+    side = "SELL" if pos["tipo"] == "LONG" else "BUY"
+    cb_order(pos["symbol"], side, qty, trade_id)
+
+
+def cb_cerrar(trade_id, razon, precio_cierre, resultado_pct):
+    pos = _cb_active.get(trade_id)
+    if pos:
+        qty_restante = pos["qty_total"]
+        if pos["tp1_tocado"]: qty_restante -= pos["qty_tp1"]
+        if pos["tp2_tocado"]: qty_restante -= pos["qty_tp2"]
+        if qty_restante > 0:
+            cb_cerrar_parcial(trade_id, qty_restante, razon)
+    with _cb_lock:
+        pos = _cb_active.pop(trade_id, None)
+    if not pos:
+        return
+    pos["resultado_pct"] = round(resultado_pct * 100, 3)
+    pos["precio_cierre"] = precio_cierre
+    pos["razon"] = razon
+    pos["ganadora"] = resultado_pct > 0
+    pos["usdt_resultado"] = round(PAPER_USDT * resultado_pct, 2)
+    _cb_trades.append(pos)
+    emoji = "\u2705" if pos["ganadora"] else "\u274c"
+    paper_telegram(f"{emoji} <b>COINBASE SANDBOX CERRADO</b> {razon}\n"
+        f"{trade_id}\n{pos['symbol']} {pos['tipo']}\n"
+        f"Entrada: {pos['precio_entrada']} Cierre: {precio_cierre}\n"
+        f"Resultado: {pos['resultado_pct']}% | P&L: ${pos['usdt_resultado']}")
+
+
+def cb_gestionar(trade_id):
+    with _cb_lock:
+        pos = dict(_cb_active.get(trade_id, {}))
+    if not pos:
+        return
+    symbol = pos["symbol"]
+    precio = cb_precio(symbol)
+    if not precio:
+        return
+    tipo = pos["tipo"]
+    entrada = pos["precio_entrada"]
+    cambio = (precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada
+    with _cb_lock:
+        if trade_id in _cb_active:
+            if tipo == "LONG":
+                _cb_active[trade_id]["mejor_precio"] = max(pos["mejor_precio"], precio)
+            else:
+                _cb_active[trade_id]["mejor_precio"] = min(pos["mejor_precio"], precio)
+    if not pos["tp1_tocado"] and cambio <= -PAPER_SL:
+        cb_cerrar(trade_id, "STOP LOSS", precio, -PAPER_SL)
+        return
+    if pos["breakeven"] and cambio <= 0:
+        cb_cerrar(trade_id, "BREAKEVEN", precio, 0)
+        return
+    if pos["trailing_activo"] and pos["trailing_stop"]:
+        if tipo == "LONG" and precio <= pos["trailing_stop"]:
+            cb_cerrar(trade_id, "TRAILING \U0001f40e", precio, (pos["trailing_stop"] - entrada) / entrada)
+            return
+        elif tipo == "SHORT" and precio >= pos["trailing_stop"]:
+            cb_cerrar(trade_id, "TRAILING \U0001f40e", precio, (entrada - pos["trailing_stop"]) / entrada)
+            return
+    if not pos["tp1_tocado"] and cambio >= PAPER_TP1:
+        cb_cerrar_parcial(trade_id, pos["qty_tp1"], "TP1")
+        with _cb_lock:
+            if trade_id in _cb_active:
+                _cb_active[trade_id]["tp1_tocado"] = True
+                _cb_active[trade_id]["breakeven"] = True
+        paper_telegram(f"\U0001f3af <b>CB SANDBOX TP1</b> {trade_id}\nPrecio: {precio} (+1.5%)\nStop breakeven")
+    if pos["tp1_tocado"] and not pos["tp2_tocado"] and cambio >= PAPER_TP2:
+        cb_cerrar_parcial(trade_id, pos["qty_tp2"], "TP2")
+        with _cb_lock:
+            if trade_id in _cb_active:
+                _cb_active[trade_id]["tp2_tocado"] = True
+                _cb_active[trade_id]["trailing_activo"] = True
+                if tipo == "LONG":
+                    _cb_active[trade_id]["trailing_stop"] = round(precio * (1 - PAPER_TRAIL), 6)
+                else:
+                    _cb_active[trade_id]["trailing_stop"] = round(precio * (1 + PAPER_TRAIL), 6)
+        paper_telegram(f"\U0001f3af <b>CB SANDBOX TP2</b> {trade_id}\nPrecio: {precio} (+2.5%)\n\U0001f40e Trailing 1.5%")
+    if pos["trailing_activo"]:
+        with _cb_lock:
+            if trade_id in _cb_active:
+                if tipo == "LONG":
+                    nuevo = round(precio * (1 - PAPER_TRAIL), 6)
+                    if nuevo > (_cb_active[trade_id]["trailing_stop"] or 0):
+                        _cb_active[trade_id]["trailing_stop"] = nuevo
+                else:
+                    nuevo = round(precio * (1 + PAPER_TRAIL), 6)
+                    ts = _cb_active[trade_id]["trailing_stop"]
+                    if ts is None or nuevo < ts:
+                        _cb_active[trade_id]["trailing_stop"] = nuevo
+
+
+def cb_monitor_loop():
+    time.sleep(45)
+    print("[CB] Monitor Coinbase sandbox arrancado")
+    while True:
+        try:
+            for tid in list(_cb_active.keys()):
+                cb_gestionar(tid)
+        except Exception as e:
+            print(f"[CB] Error: {e}")
+        time.sleep(PAPER_POLL)
+
+
+@app.route("/cb/abrir/<symbol>/<tipo>")
+def cb_abrir_manual(symbol, tipo):
+    symbol = symbol.upper()
+    tipo = tipo.upper()
+    if tipo not in ("LONG", "SHORT"):
+        return jsonify({"error": "tipo debe ser LONG o SHORT"}), 400
+    return jsonify(cb_abrir(symbol, tipo, 0))
+
+
+@app.route("/cb/posiciones")
+def cb_posiciones():
+    resultado = {}
+    for tid, pos in _cb_active.items():
+        precio = cb_precio(pos["symbol"]) or 0
+        tipo = pos["tipo"]
+        entrada = pos["precio_entrada"]
+        cambio = ((precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada) if precio else 0
+        resultado[tid] = {
+            "exchange": "coinbase_sandbox",
+            "symbol": pos["symbol"], "tipo": tipo,
+            "entrada": entrada, "precio_actual": precio,
+            "pnl_pct": round(cambio * 100, 3),
+            "sl": pos["sl"], "tp1": pos["tp1"], "tp1_tocado": pos["tp1_tocado"],
+            "tp2": pos["tp2"], "tp2_tocado": pos["tp2_tocado"],
+            "trailing_stop": pos["trailing_stop"],
+            "timestamp": pos["timestamp"],
+        }
+    return jsonify({"posiciones": resultado, "timestamp_utc": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/cb/historial")
+def cb_historial():
+    n = len(_cb_trades)
+    g = sum(1 for t in _cb_trades if t.get("ganadora"))
+    total_pct = sum(t.get("resultado_pct", 0) for t in _cb_trades)
+    total_usdt = sum(t.get("usdt_resultado", 0) for t in _cb_trades)
+    return jsonify({
+        "exchange": "coinbase_sandbox",
+        "n_trades": n, "ganadoras": g,
+        "winrate": round(g / n * 100, 1) if n else 0,
+        "total_pct": round(total_pct, 2), "total_usdt": round(total_usdt, 2),
+        "media_pct": round(total_pct / n, 3) if n else 0,
+        "trades": _cb_trades,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/cb/cerrar/<identificador>")
+def cb_cerrar_manual(identificador):
+    identificador = identificador.upper()
+    cerrados = []
+    if identificador in _cb_active:
+        pos = _cb_active[identificador]
+        precio = cb_precio(pos["symbol"]) or pos["precio_entrada"]
+        tipo = pos["tipo"]
+        entrada = pos["precio_entrada"]
+        cambio = (precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada
+        cb_cerrar(identificador, "MANUAL", precio, cambio)
+        cerrados.append(identificador)
+    else:
+        tids = [tid for tid, p in _cb_active.items() if p["symbol"] == identificador]
+        for tid in tids:
+            pos = _cb_active.get(tid)
+            if pos:
+                precio = cb_precio(pos["symbol"]) or pos["precio_entrada"]
+                tipo = pos["tipo"]
+                entrada = pos["precio_entrada"]
+                cambio = (precio - entrada) / entrada if tipo == "LONG" else (entrada - precio) / entrada
+                cb_cerrar(tid, "MANUAL", precio, cambio)
+                cerrados.append(tid)
+    if not cerrados:
+        return jsonify({"error": f"no hay posicion para {identificador}"}), 404
+    return jsonify({"ok": True, "cerrados": cerrados})
+
+
+@app.route("/comparativa")
+def comparativa_bots():
+    """Comparativa Binance testnet vs Coinbase sandbox."""
+    n_b = len(_paper_trades)
+    g_b = sum(1 for t in _paper_trades if t.get("ganadora"))
+    total_b = sum(t.get("resultado_pct", 0) for t in _paper_trades)
+
+    n_c = len(_cb_trades)
+    g_c = sum(1 for t in _cb_trades if t.get("ganadora"))
+    total_c = sum(t.get("resultado_pct", 0) for t in _cb_trades)
+
+    return jsonify({
+        "binance_testnet": {
+            "n_trades": n_b, "ganadoras": g_b,
+            "winrate": round(g_b / n_b * 100, 1) if n_b else 0,
+            "total_pct": round(total_b, 2),
+            "media_pct": round(total_b / n_b, 3) if n_b else 0,
+        },
+        "coinbase_sandbox": {
+            "n_trades": n_c, "ganadoras": g_c,
+            "winrate": round(g_c / n_c * 100, 1) if n_c else 0,
+            "total_pct": round(total_c, 2),
+            "media_pct": round(total_c / n_c, 3) if n_c else 0,
+        },
+        "timestamp_utc": datetime.now(timezone.utc).isoformat()
+    })
+
+
+# Arrancar monitor Coinbase sandbox
+_cb_monitor = threading.Thread(target=cb_monitor_loop, daemon=True)
+_cb_monitor.start()
+
+# ─── FIN COINBASE SANDBOX ───
 
 # Test de conectividad a Binance
 @app.route("/paper/test_binance")
